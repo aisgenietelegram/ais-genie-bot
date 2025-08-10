@@ -63,7 +63,7 @@ GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
 
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
-EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsement@myaisagency.com")
+EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
 
 # ---------------- Messages ----------------
 CLOSED_MESSAGE = (
