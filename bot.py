@@ -41,7 +41,7 @@ def _csv_env(name: str) -> Set[str]:
 # AIS/team groups (users seen here become authorized)
 AIS_TEAM_CHAT_IDS = _csv_env("AIS_TEAM_CHAT_IDS") or {"-4206463598", "-4181350900"}
 
-# Groups where the bot must be SILENT (collect only; never reply — not even to commands)
+# Authorized group chats = command-only mode (log + respond to commands, ignore everything else)
 SILENT_GROUP_IDS = _csv_env("SILENT_GROUP_IDS") or set(AIS_TEAM_CHAT_IDS)
 
 # Preloaded authorized user IDs (comma-separated env)
@@ -350,7 +350,6 @@ def require_authorized(func):
         return await func(update, context)
     return wrapper
 
-# Per-chat cooldown (1 hour)
 def already_sent(chat_id: str, tag: str, window_sec: int = 3600) -> bool:
     last = chat_last_response.get(chat_id, {})
     when = last.get(tag)
@@ -404,7 +403,7 @@ def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_T
 
     PENDING_REMINDER_TASKS[chat_id] = asyncio.create_task(reminder_job())
 
-# ---------------- Commands (all restricted) ----------------
+# ---------------- Commands (restricted to authorized users) ----------------
 @require_authorized
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello! I'm your agency assistant bot.\nType /help to see available commands.")
@@ -441,13 +440,11 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
     record_message_for_transcript(update)
     chat_id = str(update.effective_chat.id)
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
-    if chat_id in SILENT_GROUP_IDS:
-        # Explicitly ignore commands in silent groups
-        return
+    # Commands are allowed everywhere (including SILENT_GROUP_IDS)
     if cmd in COMMAND_MESSAGES and not already_sent(chat_id, cmd):
         await update.message.reply_text(COMMAND_MESSAGES[cmd])
         mark_sent(chat_id, cmd)
-    # mark this as an authorized reply (cancels 15-min timer, if any)
+    # Authorized command counts as an authorized reply → cancel 15-min timer if any
     mark_authorized_reply(chat_id)
     task = PENDING_REMINDER_TASKS.pop(chat_id, None)
     if task and not task.done():
@@ -512,23 +509,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_auth = bool(user and is_authorized_user(user.id))
     is_silent_chat = chat_id in SILENT_GROUP_IDS
 
-    # --- SILENT GROUPS: never reply at all ---
+    # --- COMMAND-ONLY MODE FOR AUTHORIZED GROUPS ---
     if is_silent_chat:
-        # Still collect IDs/transcripts; do nothing else
+        # Ignore all regular messages in these chats (commands handled by command handlers)
         return
 
-    # --- DYNAMIC SILENCE: if an AUTHORIZED user posts a normal message anywhere (non-silent chat),
-    # suppress all auto-spiels and timers. (Commands are handled in command handlers.)
+    # --- DYNAMIC SILENCE for non-silent chats: authorized normal messages don't trigger spiels ---
     if is_auth:
-        # Treat as an authorized reply to cancel any pending customer timer
         mark_authorized_reply(chat_id)
         task = PENDING_REMINDER_TASKS.pop(chat_id, None)
         if task and not task.done():
             task.cancel()
-        return  # <-- key change: NO auto-spiel to authorized talk in non-silent chats
+        return  # no auto-spiels to authorized talk in non-silent chats
 
-    # From here on, the sender is NON-AUTHORIZED.
-    # Per-chat cooldown helper
+    # From here, sender is non-authorized in a non-silent chat.
     async def send_once(tag: str, msg: str, md: bool = False):
         if not already_sent(chat_id, tag):
             if md:
@@ -537,14 +531,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(msg)
             mark_sent(chat_id, tag)
 
-    # Keyword: COI (only react to non-authorized)
+    # COI keywords
     if "coi" in text or "certificate" in text:
         await send_once("coi", COI_REMINDER)
         mark_customer_activity(chat_id)
         schedule_no_reply_reminder(chat_id, context)
         return
 
-    # Weekend: reply to simple hello only (from non-authorized)
+    # Weekend: reply only to simple greetings
     if is_weekend():
         if is_simple_hello(text_raw):
             await send_once("weekend_hello", WEEKEND_MESSAGE)
@@ -552,14 +546,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_reply_reminder(chat_id, context)
         return
 
-    # Lunch?
+    # Lunch
     if is_lunch_time():
         await send_once("lunch", LUNCH_MESSAGE)
         mark_customer_activity(chat_id)
         schedule_no_reply_reminder(chat_id, context)
         return
 
-    # Business hours logic
+    # Business hours
     open_, before_cutoff = is_office_open()
     if not open_:
         await send_once("closed", CLOSED_MESSAGE)
@@ -572,7 +566,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_reply_reminder(chat_id, context)
         return
 
-    # Normal ack (during business hours before cutoff)
+    # Normal ack
     await send_once("normal", "✅ Message received. We’ll take care of it shortly!")
     mark_customer_activity(chat_id)
     schedule_no_reply_reminder(chat_id, context)
@@ -584,7 +578,7 @@ async def last_call_scheduler(app):
         if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 0:
             for chat_id in known_group_chats:
                 if chat_id in SILENT_GROUP_IDS:
-                    continue  # never send to silent groups
+                    continue  # never send to authorized (command-only) groups
                 try:
                     await app.bot.send_message(chat_id=int(chat_id), text=LAST_CALL_MESSAGE, parse_mode="Markdown")
                 except Exception as e:
@@ -607,11 +601,10 @@ async def main():
     app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails"], generic_command_handler))
     app.add_handler(CommandHandler("ssinfo", ssinfo_command))
     app.add_handler(CommandHandler("ssendo", ssendo_command))
-    # message handler for plain text (commands handled above)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
     asyncio.create_task(last_call_scheduler(app))
-    logger.info("✅ Bot running with dynamic silent mode, command replies for authorized staff, and 15-min endorsements reminder.")
+    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, and 15-min endorsements reminder.")
     await app.run_polling()
 
 if __name__ == "__main__":
