@@ -39,7 +39,7 @@ def _csv_env(name: str) -> Set[str]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 # AIS/team groups (users seen here become authorized)
-AIS_TEAM_CHAT_IDS = _csv_env("AIS_TEAM_CHAT_IDS") or {"-4206463598", "-4181350900"}
+AIS_TEAM_CHAT_IDS = _csv_env("AIS_TEAM_CHAT_IDS") or {"-4206463598", "-4181350900", "-1002752307074"}
 
 # Authorized group chats = command-only mode (log + respond to commands, ignore everything else)
 SILENT_GROUP_IDS = _csv_env("SILENT_GROUP_IDS") or set(AIS_TEAM_CHAT_IDS)
