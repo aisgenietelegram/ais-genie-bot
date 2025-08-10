@@ -54,12 +54,14 @@ WEEKDAY_CUTOFF = time(16, 30)
 LUNCH_START = time(12, 30)
 LUNCH_END = time(13, 30)
 
-# Env vars
+# Env vars (NO SECRETS HARDCODED)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
 GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
 GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
+
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
 EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
 
@@ -72,16 +74,19 @@ CLOSED_MESSAGE = (
     "⚠️ Your endorsement request was not processed.\n"
     "Please reach out during business hours so it wont be overlooked. Thank you!"
 )
+
 AFTER_CUTOFF_MESSAGE = (
     "⚠️ Sorry, your endorsement was received outside the cutoff period.\n\n"
     "It will be processed the next business day. Thank you for your understanding!"
 )
+
 WEEKEND_MESSAGE = (
     "Thank you for reaching out. 😉\n\n"
     "🔒 We’re currently closed for the weekend (Saturday & Sunday). Our office will resume regular hours on Monday at 9:00 a.m.\n\n"
     "⚠️ Please note that your request was not processed, and we kindly ask that you resend it Monday morning to ensure it’s handled promptly.\n\n"
     "Thank you for your understanding! 🤗"
 )
+
 COI_REMINDER = (
     "📩 For Certificate of Insurance (COI) or certificate requests, please email us at: info@myaisagency.com\n\n"
     "📬 Kindly include:\n"
@@ -91,6 +96,7 @@ COI_REMINDER = (
     "• The email address where we should send the certificate\n\n"
     "This helps us process your request securely and efficiently. Thank you!"
 )
+
 RULES_MESSAGE = (
     "📜 *Advanced Insurance Solutions Telegram Rules*\n\n"
     "‼️ IF THE CHANGE WAS NOT CONFIRMED OVER EMAIL, IT DID NOT HAPPEN.\n"
@@ -99,8 +105,8 @@ RULES_MESSAGE = (
     "📌 *Guidelines:*\n"
     "1. All COI requests must be emailed to coi@myaisagency.com\n"
     "2. No editing of posts\n"
-    "3. Do not reply to old posts, Kindly resend the request instead\n"
-    "4. Don’t send photos of VINs, type Year, Make, and VIN\n"
+    "3. Do not reply to old posts — Kindly resend the request instead\n"
+    "4. Don’t send photos of VINs — type Year, Make, and VIN\n"
     "_Use this format for policy changes:_\n"
     "• Remove VIN: 4V4NC9TH5KN216424\n"
     "• Add VIN: 1FUJHHDR3LLLH8454\n"
@@ -108,22 +114,25 @@ RULES_MESSAGE = (
     "• Add driver: RUBENS ESTIME\n"
     "5. If your policy requires MVR, attach it. If not, we’ll order one and charge $30\n"
     "6. Send CDL with driver’s name clearly\n"
-    "7. We don’t work weekends, resend requests on Monday\n"
+    "7. We don’t work weekends — resend requests on Monday\n"
     "8. Physical Damage coverage is not automatically added\n"
     "9. We accept changes Mon–Fri, 9:00 AM–4:30 PM (4:00 PM Friday)\n"
     "10. No change is valid unless confirmed by email"
 )
+
 LAST_CALL_MESSAGE = (
     "📢 *Last Call for Changes!*\n\n"
     "Please submit any policy changes before our cut-off time:\n"
     "🗓️ Weekdays: 4:30 PM\n\n"
     "Changes after this time will be processed the next business day."
 )
+
 LUNCH_MESSAGE = (
     "🍽️ Our team is currently on lunch break (12:30 PM – 1:30 PM CT).\n\n"
     "We’ll respond once we’re back. To make sure we don’t miss anything, feel free to email us too.\n"
     "📧 info@myaisagency.com"
 )
+
 EMAILS_MESSAGE = (
     "📧 *PLEASE USE THE FOLLOWING EMAIL TO GET YOUR REQUEST PROCESSED ASAP.*\n\n"
     "• coi@myaisagency.com – For all CERTIFICATES requests please send your request\n"
@@ -131,11 +140,7 @@ EMAILS_MESSAGE = (
     "• Endorsements@myaisagency.com – For policy CHANGES / QUOTES / DRIVER & TRUCK LIST on an existing policy\n"
     "• Claims@myaisagency.com – For all CLAIMS related questions and requotes"
 )
-SIGN_MESSAGE = (
-    "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
-    "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
-    "Thank you! ✍️😊"
-)
+
 COMMAND_MESSAGES = {
     "lt": "📄 Please send us the Lease Termination to proceed with removal. This is required.",
     "apdinfo": (
@@ -154,7 +159,9 @@ COMMAND_MESSAGES = {
         "💵 Note: $30 fee applies per MVR\n"
         "🧾 PA drivers must include the last 4 digits of their SSN"
     ),
-    "sign": SIGN_MESSAGE,
+    "sign": "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
+    "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
+    "Thank you! ✍️😊",
     "emails": EMAILS_MESSAGE,
 }
 
@@ -163,17 +170,25 @@ chat_last_response: Dict[str, Dict[str, str]] = {}
 TRANSCRIPT_MAX_MESSAGES = 5
 chat_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=TRANSCRIPT_MAX_MESSAGES))
 known_group_chats: Dict[str, Dict[str, Any]] = {}
+
+# Authorized users (seen in AIS team chats) + preloaded env IDs
 team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
+
+# For 15-minute reminder
 LAST_CUSTOMER_MESSAGE_AT: Dict[str, datetime] = {}
 LAST_AUTH_REPLY_AT: Dict[str, datetime] = {}
 PENDING_REMINDER_TASKS: Dict[str, asyncio.Task] = {}
+
+# Track chats that had activity today (key: chat_id, value: YYYY-MM-DD)
 LAST_CHAT_ACTIVITY: Dict[str, str] = {}
 
 # ---------------- Helpers ----------------
 def now_in_timezone():
     return datetime.now(TIMEZONE)
+
 def is_weekend():
     return now_in_timezone().weekday() >= 5
+
 def is_office_open():
     now = now_in_timezone()
     if is_weekend():
@@ -182,11 +197,14 @@ def is_office_open():
     open_ = WEEKDAY_START <= t <= WEEKDAY_END
     before_cutoff = t <= WEEKDAY_CUTOFF
     return open_, before_cutoff
+
 def is_lunch_time():
     t = now_in_timezone().time()
     return LUNCH_START <= t <= LUNCH_END
+
 def is_authorized_user(user_id: int) -> bool:
     return (user_id in team_user_ids) or (user_id in PREAUTHORIZED_USER_IDS)
+
 def maybe_record_team_member(update: Update):
     chat_id = str(update.effective_chat.id)
     user = update.effective_user
@@ -194,6 +212,7 @@ def maybe_record_team_member(update: Update):
         if user.id not in team_user_ids:
             logger.info(f"[AIS TEAM] New authorized member from {chat_id}: {user.full_name} (ID: {user.id})")
         team_user_ids.add(user.id)
+
 def record_message_for_transcript(update: Update):
     chat = update.effective_chat
     msg = update.effective_message
@@ -209,6 +228,7 @@ def record_message_for_transcript(update: Update):
         "text": txt.strip()
     }
     chat_buffers[chat_id].append(entry)
+
 def is_simple_hello(text: str) -> bool:
     if not text:
         return False
@@ -217,6 +237,8 @@ def is_simple_hello(text: str) -> bool:
 
 # ---- Gmail API ----
 def _gmail_credentials() -> Credentials:
+    if not (GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN and GMAIL_SENDER):
+        raise RuntimeError("Missing Gmail OAuth vars")
     creds = Credentials(
         token=None,
         refresh_token=GMAIL_REFRESH_TOKEN,
@@ -227,6 +249,7 @@ def _gmail_credentials() -> Credentials:
     )
     creds.refresh(GARequest())
     return creds
+
 async def send_email_async(subject: str, body: str, to_addr: Optional[str] = None,
                            attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None):
     def _send():
@@ -250,144 +273,313 @@ async def send_email_async(subject: str, body: str, to_addr: Optional[str] = Non
             return False, str(e)
     return await asyncio.to_thread(_send)
 
-# ---- Transcript Rendering ----
-def render_transcript_image(chat_id: str) -> Optional[bytes]:
-    if not PIL_OK:
+# ---- Transcript rendering ----
+def render_transcript_image(chat_title: str, entries: deque) -> Optional[bytes]:
+    if not entries or not PIL_OK:
         return None
-    msgs = list(chat_buffers.get(chat_id, []))
-    if not msgs:
-        return None
-    width = 800
-    padding = 20
+
+    width = 1000
+    margin = 40
+    line_spacing = 8
+    title_size = 36
+    text_size = 24
+    bg = (255, 255, 255)
+    title_color = (20, 20, 20)
+    meta_color = (90, 90, 90)
+    text_color = (0, 0, 0)
+
     try:
-        font = ImageFont.truetype("arial.ttf", 20)
+        font_title = ImageFont.truetype("arial.ttf", title_size)
+        font_meta = ImageFont.truetype("arial.ttf", text_size)
+        font_text = ImageFont.truetype("arial.ttf", text_size)
     except Exception:
-        font = ImageFont.load_default()
-    lines = []
-    for m in msgs:
-        lines.append(f"[{m['ts']}] {m['name']}: {m['text']}")
-    text = "\n".join(lines)
-    wrapper = textwrap.TextWrapper(width=90)
-    wrapped = "\n".join(wrapper.wrap(text))
-    lines_wrapped = wrapped.split("\n")
-    img_height = padding * 2 + len(lines_wrapped) * 24
-    img = Image.new("RGB", (width, img_height), color="white")
+        font_title = ImageFont.load_default()
+        font_meta = ImageFont.load_default()
+        font_text = ImageFont.load_default()
+
+    lines = [("title", f"Chat: {chat_title or '(untitled)'}")]
+    for e in entries:
+        lines.append(("meta", f"[{e['ts']}] {e['name']}:"))
+        for w in (textwrap.wrap(e["text"], width=70) or [""]):
+            lines.append(("text", w))
+        lines.append(("spacer", ""))
+
+    def text_h(draw, content, font):
+        bbox = draw.textbbox((0, 0), content, font=font)
+        return bbox[3] - bbox[1]
+
+    img_tmp = Image.new("RGB", (width, 10), bg)
+    dtmp = ImageDraw.Draw(img_tmp)
+    y = margin
+    for t, content in lines:
+        if t == "title":
+            h = text_h(dtmp, content, font_title)
+        elif t == "meta":
+            h = text_h(dtmp, content, font_meta)
+        elif t == "text":
+            h = text_h(dtmp, content, font_text)
+        else:
+            h = max(4, text_size // 2)
+        y += h + line_spacing
+    height = y + margin
+
+    img = Image.new("RGB", (width, height), bg)
     draw = ImageDraw.Draw(img)
-    y = padding
-    for line in lines_wrapped:
-        draw.text((padding, y), line, fill="black", font=font)
-        y += 24
+    y = margin
+    for t, content in lines:
+        if t == "title":
+            draw.text((margin, y), content, font=font_title, fill=title_color)
+            h = text_h(draw, content, font_title)
+        elif t == "meta":
+            draw.text((margin, y), content, font=font_meta, fill=meta_color)
+            h = text_h(draw, content, font_meta)
+        elif t == "text":
+            draw.text((margin, y), content, font=font_text, fill=text_color)
+            h = text_h(draw, content, font_text)
+        else:
+            h = max(4, text_size // 2)
+        y += h + line_spacing
+
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ---- Reminder Logic ----
-async def schedule_reminder(chat_id: str):
-    if chat_id in PENDING_REMINDER_TASKS:
-        return
-    async def _reminder():
-        try:
-            await asyncio.sleep(900)  # 15 minutes
-            today_str = now_in_timezone().strftime("%Y-%m-%d")
-            if (chat_id in LAST_CUSTOMER_MESSAGE_AT and
-                LAST_CUSTOMER_MESSAGE_AT[chat_id].strftime("%Y-%m-%d") == today_str and
-                (chat_id not in LAST_AUTH_REPLY_AT or LAST_AUTH_REPLY_AT[chat_id] < LAST_CUSTOMER_MESSAGE_AT[chat_id])):
-                transcript_img = render_transcript_image(chat_id)
-                sent, err = await send_email_async(
-                    subject=f"[Telegram] Unanswered chat reminder {chat_id}",
-                    body=f"Unanswered message in chat {chat_id}",
-                    to_addr=EMAIL_ENDORSEMENT,
-                    attach_name="transcript.png" if transcript_img else None,
-                    attach_bytes=transcript_img
-                )
-                if not sent:
-                    logger.error(f"Failed to send reminder email: {err}")
-        finally:
-            PENDING_REMINDER_TASKS.pop(chat_id, None)
-    task = asyncio.create_task(_reminder())
-    PENDING_REMINDER_TASKS[chat_id] = task
+# ---------------- Authorization + cooldown helpers ----------------
+def require_authorized(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        maybe_record_team_member(update)
+        user = update.effective_user
+        if not user or not is_authorized_user(user.id):
+            await update.message.reply_text("Not authorized.")
+            return
+        return await func(update, context)
+    return wrapper
 
-# ---- Command Handlers ----
-async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    maybe_record_team_member(update)
-    record_message_for_transcript(update)
-    chat_id = str(update.effective_chat.id)
-    cmd = update.message.text.lstrip("/").split()[0].lower()
-    if cmd in COMMAND_MESSAGES:
-        await update.message.reply_text(COMMAND_MESSAGES[cmd])
+def already_sent(chat_id: str, tag: str, window_sec: int = 3600) -> bool:
+    last = chat_last_response.get(chat_id, {})
+    when = last.get(tag)
+    if not when:
+        return False
+    try:
+        delta = now_in_timezone() - datetime.fromisoformat(when)
+        return delta.total_seconds() < window_sec
+    except Exception:
+        return False
+
+def mark_sent(chat_id: str, tag: str):
+    chat_last_response.setdefault(chat_id, {})[tag] = now_in_timezone().isoformat()
+
+# --- 15-minute reminder helpers ---
+def mark_customer_activity(chat_id: str):
+    LAST_CUSTOMER_MESSAGE_AT[chat_id] = now_in_timezone()
+
+def mark_authorized_reply(chat_id: str):
     LAST_AUTH_REPLY_AT[chat_id] = now_in_timezone()
 
+def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_TYPE):
+    task = PENDING_REMINDER_TASKS.get(chat_id)
+    if task and not task.done():
+        task.cancel()
+
+    async def reminder_job():
+        try:
+            await asyncio.sleep(15 * 60)
+            last_customer = LAST_CUSTOMER_MESSAGE_AT.get(chat_id)
+            last_auth = LAST_AUTH_REPLY_AT.get(chat_id)
+            if last_customer and (not last_auth or last_auth < last_customer):
+                subject = f"[No Reply 15m] Chat {chat_id}"
+                body = (
+                    f"No authorized reply in chat {chat_id} for 15 minutes after a customer message.\n"
+                    f"Time (local): {now_in_timezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+                entries = list(chat_buffers.get(chat_id, []))
+                png_bytes = render_transcript_image("", entries) if entries else None
+                await send_email_async(
+                    subject=subject,
+                    body=body if not png_bytes else (body + "\n(Transcript image attached.)"),
+                    to_addr=EMAIL_ENDORSEMENT,
+                    attach_name=f"no_reply_{chat_id}.png" if png_bytes else None,
+                    attach_bytes=png_bytes
+                )
+        except asyncio.CancelledError:
+            pass
+        finally:
+            PENDING_REMINDER_TASKS.pop(chat_id, None)
+
+    PENDING_REMINDER_TASKS[chat_id] = asyncio.create_task(reminder_job())
+
+# ---------------- Commands (restricted to authorized users) ----------------
+@require_authorized
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hello! I'm your agency assistant bot.\nType /help to see available commands.")
+
+@require_authorized
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Available commands (restricted to AIS TEAM members):\n"
+        "/start – Welcome message\n"
+        "/help – Show available commands\n"
+        "/myid – Get your chat ID\n"
+        "/lt\n/apdinfo\n/mvr\n/sign\n/Rules – Send & pin the rules\n/emails – Contact emails\n"
+        "/ssinfo – Email transcript to your default address\n"
+        "/ssendo – Email transcript to your endorsement address"
+    )
+
+@require_authorized
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🆔 Your chat ID is: {update.effective_chat.id}", parse_mode="Markdown")
+
+@require_authorized
 async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    maybe_record_team_member(update)
-    record_message_for_transcript(update)
-    await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
-    LAST_AUTH_REPLY_AT[str(update.effective_chat.id)] = now_in_timezone()
-
-async def transcript_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
-    transcript_img = render_transcript_image(chat_id)
-    if transcript_img:
-        await update.message.reply_photo(photo=transcript_img)
+    if not already_sent(chat_id, "rules_cmd"):
+        sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
+        mark_sent(chat_id, "rules_cmd")
+        try:
+            await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
+        except Exception as e:
+            logger.warning(f"Unable to pin rules in chat {chat_id}: {e}")
+
+@require_authorized
+async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    record_message_for_transcript(update)
+    chat_id = str(update.effective_chat.id)
+    cmd = (update.message.text or "").split()[0].lstrip("/").lower()
+    # Commands are allowed everywhere (including SILENT_GROUP_IDS)
+    if cmd in COMMAND_MESSAGES and not already_sent(chat_id, cmd):
+        await update.message.reply_text(COMMAND_MESSAGES[cmd])
+        mark_sent(chat_id, cmd)
+    # Authorized command counts as an authorized reply → cancel 15-min timer if any
+    mark_authorized_reply(chat_id)
+    task = PENDING_REMINDER_TASKS.pop(chat_id, None)
+    if task and not task.done():
+        task.cancel()
+
+async def _send_transcript_email(update: Update, to_addr: str):
+    chat = update.effective_chat
+    chat_id = str(chat.id)
+    entries = list(chat_buffers.get(chat_id, []))
+    if not entries:
+        await update.message.reply_text("No recent text messages to capture for this chat.")
+        return
+    await update.message.reply_text("⏳ Preparing transcript…")
+
+    png_bytes = render_transcript_image(chat.title or "", entries)
+    ts = now_in_timezone().strftime("%Y%m%d-%H%M%S")
+    if png_bytes:
+        ok, err = await send_email_async(
+            subject=f"[Telegram] Transcript – {chat.title or ''} ({chat_id})",
+            body=f"Attached is the transcript image of the last {len(entries)} message(s).",
+            to_addr=to_addr,
+            attach_name=f"telegram_transcript_{chat_id}_{ts}.png",
+            attach_bytes=png_bytes,
+        )
     else:
-        msgs = chat_buffers.get(chat_id)
-        if msgs:
-            text = "\n".join(f"[{m['ts']}] {m['name']}: {m['text']}" for m in msgs)
-            await update.message.reply_text(text)
-        else:
-            await update.message.reply_text("No transcript available.")
+        body = "\n".join([f"[{e['ts']}] {e['name']}: {e['text']}" for e in entries])
+        ok, err = await send_email_async(
+            subject=f"[Telegram] Transcript (text) – {chat.title or ''} ({chat_id})",
+            body=body,
+            to_addr=to_addr,
+        )
+    if ok:
+        await update.message.reply_text(f"✅ Transcript sent to {to_addr}")
+    else:
+        await update.message.reply_text(f"❌ Failed to send email to {to_addr}: {err or 'Unknown error'}")
 
-# ---- Message Handler ----
+@require_authorized
+async def ssinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_transcript_email(update, EMAIL_DEFAULT_TO)
+
+@require_authorized
+async def ssendo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_transcript_email(update, EMAIL_ENDORSEMENT)
+
+# ---------------- Message handler (auto spiels) ----------------
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    chat_id = str(update.effective_chat.id)
-    user_id = update.effective_user.id
-    text = update.message.text or ""
+    chat = update.effective_chat
+    user = update.effective_user
+    chat_id = str(chat.id)
+    text_raw = update.message.text or ""
+    text = text_raw.lower()
+    now = now_in_timezone()
 
+    # Track group + transcript + (maybe) authorize AIS members
+    if chat.type in (Chat.GROUP, Chat.SUPERGROUP):
+        if chat_id not in known_group_chats:
+            known_group_chats[chat_id] = {"title": chat.title or "", "added_on": now.isoformat()}
+            logger.info(f"Saved new group: {chat_id}")
     maybe_record_team_member(update)
     record_message_for_transcript(update)
 
-    # Track daily activity for last call targeting
-    LAST_CHAT_ACTIVITY[chat_id] = now_in_timezone().strftime("%Y-%m-%d")
+    # Mark this chat as active today
+    LAST_CHAT_ACTIVITY[chat_id] = now.strftime("%Y-%m-%d")
 
-    # If in silent group (command-only)
-    if chat_id in SILENT_GROUP_IDS and not update.message.text.startswith("/"):
+    is_auth = bool(user and is_authorized_user(user.id))
+    is_silent_chat = chat_id in SILENT_GROUP_IDS
+
+    # --- COMMAND-ONLY MODE FOR AUTHORIZED GROUPS ---
+    if is_silent_chat:
+        # Ignore all regular messages in these chats (commands handled by command handlers)
         return
 
-    if is_authorized_user(user_id):
-        LAST_AUTH_REPLY_AT[chat_id] = now_in_timezone()
+    # --- DYNAMIC SILENCE for non-silent chats: authorized normal messages don't trigger spiels ---
+    if is_auth:
+        mark_authorized_reply(chat_id)
+        task = PENDING_REMINDER_TASKS.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+        return  # no auto-spiels to authorized talk in non-silent chats
+
+    # From here, sender is non-authorized in a non-silent chat.
+    async def send_once(tag: str, msg: str, md: bool = False):
+        if not already_sent(chat_id, tag):
+            if md:
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            else:
+                await update.message.reply_text(msg)
+            mark_sent(chat_id, tag)
+
+    # COI keywords
+    if "coi" in text or "certificate" in text:
+        await send_once("coi", COI_REMINDER)
+        mark_customer_activity(chat_id)
+        schedule_no_reply_reminder(chat_id, context)
         return
 
-    # Non-authorized user logic
-    LAST_CUSTOMER_MESSAGE_AT[chat_id] = now_in_timezone()
-    await schedule_reminder(chat_id)
-
-    if is_simple_hello(text) and is_weekend():
-        await update.message.reply_text(WEEKEND_MESSAGE)
+    # Weekend: reply only to simple greetings
+    if is_weekend():
+        if is_simple_hello(text_raw):
+            await send_once("weekend_hello", WEEKEND_MESSAGE)
+        mark_customer_activity(chat_id)
+        schedule_no_reply_reminder(chat_id, context)
         return
 
+    # Lunch
+    if is_lunch_time():
+        await send_once("lunch", LUNCH_MESSAGE)
+        mark_customer_activity(chat_id)
+        schedule_no_reply_reminder(chat_id, context)
+        return
+
+    # Business hours
     open_, before_cutoff = is_office_open()
     if not open_:
-        if is_weekend():
-            await update.message.reply_text(WEEKEND_MESSAGE)
-            return
-        else:
-            await update.message.reply_text(CLOSED_MESSAGE)
-            return
-
-    if is_lunch_time():
-        await update.message.reply_text(LUNCH_MESSAGE)
+        await send_once("closed", CLOSED_MESSAGE)
+        mark_customer_activity(chat_id)
+        schedule_no_reply_reminder(chat_id, context)
         return
-
     if not before_cutoff:
-        await update.message.reply_text(AFTER_CUTOFF_MESSAGE)
+        await send_once("cutoff", AFTER_CUTOFF_MESSAGE)
+        mark_customer_activity(chat_id)
+        schedule_no_reply_reminder(chat_id, context)
         return
 
-    if "coi" in text.lower() or "certificate" in text.lower():
-        await update.message.reply_text(COI_REMINDER)
-        return
+    # Normal ack
+    await send_once("normal", "✅ Message received. We’ll take care of it shortly!")
+    mark_customer_activity(chat_id)
+    schedule_no_reply_reminder(chat_id, context)
 
-# ---- Scheduler ----
+# ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
     while True:
         now = now_in_timezone()
@@ -406,15 +598,36 @@ async def last_call_scheduler(app):
             logger.exception("last_call_scheduler loop error")
             await asyncio.sleep(60)
 
-# ---- Main ----
-def main():
+# ---------------- Main ----------------
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.exception("Unhandled error", exc_info=context.error)
+
+async def main():
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN not set"); return
+    # Optional: simple env presence log (no secrets)
+    missing = [k for k in ("GMAIL_CLIENT_ID","GMAIL_CLIENT_SECRET","GMAIL_REFRESH_TOKEN","GMAIL_SENDER") if not os.getenv(k)]
+    if missing:
+        logger.warning(f"Gmail env missing: {missing}")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails"], generic_command_handler))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("Rules", rules_command))
     app.add_handler(CommandHandler("rules", rules_command))
-    app.add_handler(CommandHandler("transcript", transcript_command))
-    app.add_handler(MessageHandler(filters.ALL & (~filters.COMMAND), message_handler))
-    app.job_queue.run_repeating(lambda ctx: asyncio.create_task(last_call_scheduler(app)), interval=60, first=0)
-    app.run_polling()
+    app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails"], generic_command_handler))
+    app.add_handler(CommandHandler("ssinfo", ssinfo_command))
+    app.add_handler(CommandHandler("ssendo", ssendo_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_error_handler(on_error)
+    asyncio.create_task(last_call_scheduler(app))
+    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    try:
+        import nest_asyncio; nest_asyncio.apply()
+    except Exception:
+        pass
+    asyncio.run(main())
