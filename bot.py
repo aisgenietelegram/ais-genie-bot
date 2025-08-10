@@ -105,8 +105,8 @@ RULES_MESSAGE = (
     "📌 *Guidelines:*\n"
     "1. All COI requests must be emailed to coi@myaisagency.com\n"
     "2. No editing of posts\n"
-    "3. Do not reply to old posts — Kindly resend the request instead\n"
-    "4. Don’t send photos of VINs — type Year, Make, and VIN\n"
+    "3. Do not reply to old posts, Kindly resend the request instead\n"
+    "4. Don’t send photos of VINs, type Year, Make, and VIN\n"
     "_Use this format for policy changes:_\n"
     "• Remove VIN: 4V4NC9TH5KN216424\n"
     "• Add VIN: 1FUJHHDR3LLLH8454\n"
@@ -114,7 +114,7 @@ RULES_MESSAGE = (
     "• Add driver: RUBENS ESTIME\n"
     "5. If your policy requires MVR, attach it. If not, we’ll order one and charge $30\n"
     "6. Send CDL with driver’s name clearly\n"
-    "7. We don’t work weekends — resend requests on Monday\n"
+    "7. We don’t work weekends, resend requests on Monday\n"
     "8. Physical Damage coverage is not automatically added\n"
     "9. We accept changes Mon–Fri, 9:00 AM–4:30 PM (4:00 PM Friday)\n"
     "10. No change is valid unless confirmed by email"
@@ -143,7 +143,7 @@ EMAILS_MESSAGE = (
 
 # New /check command message
 CHECK_MESSAGE = (
-    "📬 Please check your email — we’ve sent your documents for **e-signature**.\n"
+    "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
     "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
     "Thank you! ✍️😊"
 )
