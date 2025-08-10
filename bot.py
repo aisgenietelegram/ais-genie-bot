@@ -39,7 +39,7 @@ def _csv_env(name: str) -> Set[str]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 # AIS/team groups (users seen here become authorized)
-AIS_TEAM_CHAT_IDS = _csv_env("AIS_TEAM_CHAT_IDS") or {"-4206463598", "-4181350900", "-1002752307074"}
+AIS_TEAM_CHAT_IDS = _csv_env("AIS_TEAM_CHAT_IDS") or {"-4206463598", "-4181350900"}
 
 # Authorized group chats = command-only mode (log + respond to commands, ignore everything else)
 SILENT_GROUP_IDS = _csv_env("SILENT_GROUP_IDS") or set(AIS_TEAM_CHAT_IDS)
@@ -63,7 +63,7 @@ GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
 
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
-EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
+EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsement@myaisagency.com")
 
 # ---------------- Messages ----------------
 CLOSED_MESSAGE = (
@@ -176,6 +176,9 @@ team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
 LAST_CUSTOMER_MESSAGE_AT: Dict[str, datetime] = {}
 LAST_AUTH_REPLY_AT: Dict[str, datetime] = {}
 PENDING_REMINDER_TASKS: Dict[str, asyncio.Task] = {}
+
+# Track chats that had activity today (key: chat_id, value: YYYY-MM-DD)
+LAST_CHAT_ACTIVITY: Dict[str, str] = {}
 
 # ---------------- Helpers ----------------
 def now_in_timezone():
@@ -506,6 +509,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     maybe_record_team_member(update)
     record_message_for_transcript(update)
 
+    # Mark this chat as active today
+    LAST_CHAT_ACTIVITY[chat_id] = now.strftime("%Y-%m-%d")
+
     is_auth = bool(user and is_authorized_user(user.id))
     is_silent_chat = chat_id in SILENT_GROUP_IDS
 
@@ -571,19 +577,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_customer_activity(chat_id)
     schedule_no_reply_reminder(chat_id, context)
 
-# ---------------- Optional scheduler: 4:00 PM CT last call (weekdays) ----------------
+# ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
     while True:
         now = now_in_timezone()
-        if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 0:
-            for chat_id in known_group_chats:
-                if chat_id in SILENT_GROUP_IDS:
-                    continue  # never send to authorized (command-only) groups
-                try:
-                    await app.bot.send_message(chat_id=int(chat_id), text=LAST_CALL_MESSAGE, parse_mode="Markdown")
-                except Exception as e:
-                    logger.error(f"Failed to send last call to {chat_id}: {e}")
-        await asyncio.sleep(60)
+        try:
+            if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 0:
+                today_str = now.strftime("%Y-%m-%d")
+                targets = [cid for cid, d in LAST_CHAT_ACTIVITY.items()
+                           if d == today_str and cid not in SILENT_GROUP_IDS]
+                for chat_id in targets:
+                    try:
+                        await app.bot.send_message(chat_id=int(chat_id), text=LAST_CALL_MESSAGE, parse_mode="Markdown")
+                    except Exception as e:
+                        logger.error(f"Failed to send last call to {chat_id}: {e}")
+            await asyncio.sleep(60)
+        except Exception as e:
+            logger.exception("last_call_scheduler loop error")
+            await asyncio.sleep(60)
 
 # ---------------- Main ----------------
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -592,6 +603,11 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not set"); return
+    # Optional: simple env presence log (no secrets)
+    missing = [k for k in ("GMAIL_CLIENT_ID","GMAIL_CLIENT_SECRET","GMAIL_REFRESH_TOKEN","GMAIL_SENDER") if not os.getenv(k)]
+    if missing:
+        logger.warning(f"Gmail env missing: {missing}")
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -604,7 +620,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
     asyncio.create_task(last_call_scheduler(app))
-    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, and 15-min endorsements reminder.")
+    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
     await app.run_polling()
 
 if __name__ == "__main__":
