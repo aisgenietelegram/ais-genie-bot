@@ -160,8 +160,8 @@ COMMAND_MESSAGES = {
         "🧾 PA drivers must include the last 4 digits of their SSN"
     ),
     "sign": "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
-    "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
-    "Thank you! ✍️😊",
+            "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
+            "Thank you! ✍️😊",
     "emails": EMAILS_MESSAGE,
 }
 
@@ -408,7 +408,7 @@ def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_T
 
     PENDING_REMINDER_TASKS[chat_id] = asyncio.create_task(reminder_job())
 
-# ---------------- Commands (restricted to authorized users) ----------------
+# ---------------- Commands (authorized-only) — NO COOLDOWN ----------------
 @require_authorized
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello! I'm your agency assistant bot.\nType /help to see available commands.")
@@ -427,28 +427,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_authorized
 async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🆔 Your chat ID is: {update.effective_chat.id}", parse_mode="Markdown")
+    await update.message.reply_text(f"🆔 Your chat ID is: `{update.effective_chat.id}`", parse_mode="Markdown")
 
 @require_authorized
 async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if not already_sent(chat_id, "rules_cmd"):
-        sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
-        mark_sent(chat_id, "rules_cmd")
-        try:
-            await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
-        except Exception as e:
-            logger.warning(f"Unable to pin rules in chat {chat_id}: {e}")
+    # Always post & try to pin (no cooldown on commands)
+    sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
+    try:
+        await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        logger.warning(f"Unable to pin rules in chat {update.effective_chat.id}: {e}")
 
 @require_authorized
 async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_message_for_transcript(update)
     chat_id = str(update.effective_chat.id)
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
-    # Commands are allowed everywhere (including SILENT_GROUP_IDS)
-    if cmd in COMMAND_MESSAGES and not already_sent(chat_id, cmd):
+
+    # Commands are allowed everywhere (including SILENT_GROUP_IDS) — ALWAYS reply
+    if cmd in COMMAND_MESSAGES:
         await update.message.reply_text(COMMAND_MESSAGES[cmd])
-        mark_sent(chat_id, cmd)
+
     # Authorized command counts as an authorized reply → cancel 15-min timer if any
     mark_authorized_reply(chat_id)
     task = PENDING_REMINDER_TASKS.pop(chat_id, None)
@@ -622,7 +621,7 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
     asyncio.create_task(last_call_scheduler(app))
-    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
+    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, **no command cooldown**, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
     await app.run_polling()
 
 if __name__ == "__main__":
