@@ -141,6 +141,13 @@ EMAILS_MESSAGE = (
     "• Claims@myaisagency.com – For all CLAIMS related questions and requotes"
 )
 
+# New /check command message
+CHECK_MESSAGE = (
+    "📬 Please check your email — we’ve sent your documents for **e-signature**.\n"
+    "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
+    "Thank you! ✍️😊"
+)
+
 COMMAND_MESSAGES = {
     "lt": "📄 Please send us the Lease Termination to proceed with removal. This is required.",
     "apdinfo": (
@@ -161,6 +168,7 @@ COMMAND_MESSAGES = {
     ),
     "sign": "✍️ We sent you documents to sign via email. Please complete them ASAP!",
     "emails": EMAILS_MESSAGE,
+    "check": CHECK_MESSAGE,  # <-- new command
 }
 
 # ---------------- State ----------------
@@ -342,7 +350,7 @@ def render_transcript_image(chat_title: str, entries: deque) -> Optional[bytes]:
     img.save(buf, format="PNG")
     return buf.getvalue()
 
-# ---------------- Authorization + cooldown helpers ----------------
+# ---------------- Authorization + cooldown helpers (auto-spiels still use cooldown) ----------------
 def require_authorized(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         maybe_record_team_member(update)
@@ -406,7 +414,7 @@ def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_T
 
     PENDING_REMINDER_TASKS[chat_id] = asyncio.create_task(reminder_job())
 
-# ---------------- Commands (restricted to authorized users) ----------------
+# ---------------- Commands (authorized-only) — NO COOLDOWN ----------------
 @require_authorized
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👋 Hello! I'm your agency assistant bot.\nType /help to see available commands.")
@@ -414,13 +422,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_authorized
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Available commands (restricted to AIS TEAM members):\n"
-        "/start – Welcome message\n"
-        "/help – Show available commands\n"
-        "/myid – Get your chat ID\n"
-        "/lt\n/apdinfo\n/mvr\n/sign\n/Rules – Send & pin the rules\n/emails – Contact emails\n"
-        "/ssinfo – Email transcript to your default address\n"
-        "/ssendo – Email transcript to your endorsement address"
+        "🤖 Available commands (AIS TEAM only):\n"
+        "/start – Welcome\n"
+        "/help – This list\n"
+        "/myid – Your chat ID\n"
+        "/rules – Send & pin rules\n"
+        "/lt /apdinfo /mvr /sign /emails – Quick replies\n"
+        "/check – Ask client to check email & sign\n"
+        "/ssinfo – Email transcript to info@\n"
+        "/ssendo – Email transcript to endorsements@"
     )
 
 @require_authorized
@@ -429,24 +439,23 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_authorized
 async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = str(update.effective_chat.id)
-    if not already_sent(chat_id, "rules_cmd"):
-        sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
-        mark_sent(chat_id, "rules_cmd")
-        try:
-            await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
-        except Exception as e:
-            logger.warning(f"Unable to pin rules in chat {chat_id}: {e}")
+    # No cooldown: always post & attempt to pin
+    sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
+    try:
+        await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
+    except Exception as e:
+        logger.warning(f"Unable to pin rules in chat {update.effective_chat.id}: {e}")
 
 @require_authorized
 async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     record_message_for_transcript(update)
     chat_id = str(update.effective_chat.id)
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
-    # Commands are allowed everywhere (including SILENT_GROUP_IDS)
-    if cmd in COMMAND_MESSAGES and not already_sent(chat_id, cmd):
+
+    # Commands are allowed everywhere (including SILENT_GROUP_IDS) — NO cooldown
+    if cmd in COMMAND_MESSAGES:
         await update.message.reply_text(COMMAND_MESSAGES[cmd])
-        mark_sent(chat_id, cmd)
+
     # Authorized command counts as an authorized reply → cancel 15-min timer if any
     mark_authorized_reply(chat_id)
     task = PENDING_REMINDER_TASKS.pop(chat_id, None)
@@ -614,13 +623,13 @@ async def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("Rules", rules_command))
     app.add_handler(CommandHandler("rules", rules_command))
-    app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails"], generic_command_handler))
+    app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails", "check"], generic_command_handler))
     app.add_handler(CommandHandler("ssinfo", ssinfo_command))
     app.add_handler(CommandHandler("ssendo", ssendo_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
     asyncio.create_task(last_call_scheduler(app))
-    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
+    logger.info("✅ Bot running: command-only authorized groups, dynamic silent mode, no command cooldown, /check added, 15-min endorsements reminder, and 'Last Call' only to active chats.")
     await app.run_polling()
 
 if __name__ == "__main__":
