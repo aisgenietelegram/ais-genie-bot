@@ -1,15 +1,15 @@
 import os
-import json
 import logging
 import asyncio
 from datetime import datetime, time
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Set
+
 import pytz
 from email.message import EmailMessage
-import base64
 import io
 import textwrap
+import smtplib, ssl
 
 from telegram import Update, Chat
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -20,12 +20,6 @@ try:
     PIL_OK = True
 except Exception:
     PIL_OK = False
-
-# Gmail OAuth
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GARequest
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -54,13 +48,15 @@ WEEKDAY_CUTOFF = time(16, 30)
 LUNCH_START = time(12, 30)
 LUNCH_END = time(13, 30)
 
-# Env vars (NO SECRETS HARDCODED)
+# Reminder minutes (make small like 1 for testing)
+REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "15"))
+
+# Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
-GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
-GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
+# SMTP (App Password) – required for email sending
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")  # 16-char app password
 
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
 EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
@@ -159,14 +155,16 @@ COMMAND_MESSAGES = {
         "💵 Note: $30 fee applies per MVR\n"
         "🧾 PA drivers must include the last 4 digits of their SSN"
     ),
-    "sign": "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
-            "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
-            "Thank you! ✍️😊",
+    "sign": (
+        "📬 Please check your email, we’ve sent your documents for **e-signature**.\n"
+        "Kindly review and sign at your earliest convenience. If you have any questions, reply here and we’ll help. "
+        "Thank you! ✍️😊"
+    ),
     "emails": EMAILS_MESSAGE,
 }
 
 # ---------------- State ----------------
-chat_last_response: Dict[str, Dict[str, str]] = {}
+chat_last_response: Dict[str, Dict[str, str]] = {}          # cooldowns for auto-spiels only
 TRANSCRIPT_MAX_MESSAGES = 5
 chat_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=TRANSCRIPT_MAX_MESSAGES))
 known_group_chats: Dict[str, Dict[str, Any]] = {}
@@ -235,26 +233,13 @@ def is_simple_hello(text: str) -> bool:
     t = text.strip().lower()
     return t in {"hi", "hello", "hey", "yo", "good morning", "good evening", "good afternoon"}
 
-# ---- Gmail API ----
-def _gmail_credentials() -> Credentials:
-    if not (GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN and GMAIL_SENDER):
-        raise RuntimeError("Missing Gmail OAuth vars")
-    creds = Credentials(
-        token=None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/gmail.send"],
-    )
-    creds.refresh(GARequest())
-    return creds
-
+# ---- Email via SMTP (App Password) ----
 async def send_email_async(subject: str, body: str, to_addr: Optional[str] = None,
                            attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None):
     def _send():
+        if not (GMAIL_SENDER and GMAIL_APP_PASSWORD):
+            return False, "Missing GMAIL_SENDER or GMAIL_APP_PASSWORD"
         try:
-            service = build("gmail", "v1", credentials=_gmail_credentials(), cache_discovery=False)
             msg = EmailMessage()
             msg["From"] = GMAIL_SENDER
             msg["To"] = to_addr or EMAIL_DEFAULT_TO
@@ -262,14 +247,17 @@ async def send_email_async(subject: str, body: str, to_addr: Optional[str] = Non
             msg.set_content(body)
             if attach_bytes and attach_name:
                 msg.add_attachment(attach_bytes, maintype="image", subtype="png", filename=attach_name)
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-            service.users().messages().send(userId="me", body={"raw": raw}).execute()
+
+            context = ssl.create_default_context()
+            with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+                server.send_message(msg)
             return True, None
-        except HttpError as he:
-            logger.exception("Gmail API error")
-            return False, f"Gmail API error: {he}"
         except Exception as e:
-            logger.exception("Gmail send failed")
+            logger.exception("SMTP send failed")
             return False, str(e)
     return await asyncio.to_thread(_send)
 
@@ -308,6 +296,8 @@ def render_transcript_image(chat_title: str, entries: deque) -> Optional[bytes]:
         bbox = draw.textbbox((0, 0), content, font=font)
         return bbox[3] - bbox[1]
 
+    # measure height
+    from PIL import Image
     img_tmp = Image.new("RGB", (width, 10), bg)
     dtmp = ImageDraw.Draw(img_tmp)
     y = margin
@@ -379,30 +369,41 @@ def mark_authorized_reply(chat_id: str):
 def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_TYPE):
     task = PENDING_REMINDER_TASKS.get(chat_id)
     if task and not task.done():
+        logger.info(f"[reminder] canceled existing timer for chat {chat_id}")
         task.cancel()
 
     async def reminder_job():
         try:
-            await asyncio.sleep(15 * 60)
+            logger.info(f"[reminder] scheduling {REMINDER_MINUTES}m timer for chat {chat_id}")
+            await asyncio.sleep(REMINDER_MINUTES * 60)
             last_customer = LAST_CUSTOMER_MESSAGE_AT.get(chat_id)
             last_auth = LAST_AUTH_REPLY_AT.get(chat_id)
+            logger.info(f"[reminder] fired for chat {chat_id} | last_customer={last_customer} last_auth={last_auth}")
             if last_customer and (not last_auth or last_auth < last_customer):
-                subject = f"[No Reply 15m] Chat {chat_id}"
+                subject = f"[No Reply {REMINDER_MINUTES}m] Chat {chat_id}"
                 body = (
-                    f"No authorized reply in chat {chat_id} for 15 minutes after a customer message.\n"
+                    f"No authorized reply in chat {chat_id} for {REMINDER_MINUTES} minutes after a customer message.\n"
                     f"Time (local): {now_in_timezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 )
                 entries = list(chat_buffers.get(chat_id, []))
                 png_bytes = render_transcript_image("", entries) if entries else None
-                await send_email_async(
+                ok, err = await send_email_async(
                     subject=subject,
                     body=body if not png_bytes else (body + "\n(Transcript image attached.)"),
                     to_addr=EMAIL_ENDORSEMENT,
                     attach_name=f"no_reply_{chat_id}.png" if png_bytes else None,
                     attach_bytes=png_bytes
                 )
+                if ok:
+                    logger.info(f"[reminder] email sent to {EMAIL_ENDORSEMENT} for chat {chat_id}")
+                else:
+                    logger.error(f"[reminder] email FAILED for chat {chat_id}: {err}")
+            else:
+                logger.info(f"[reminder] no email needed for chat {chat_id} (authorized reply detected or no customer msg).")
         except asyncio.CancelledError:
-            pass
+            logger.info(f"[reminder] timer canceled for chat {chat_id}")
+        except Exception as e:
+            logger.exception(f"[reminder] unexpected error for chat {chat_id}: {e}")
         finally:
             PENDING_REMINDER_TASKS.pop(chat_id, None)
 
@@ -416,13 +417,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_authorized
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Available commands (restricted to AIS TEAM members):\n"
-        "/start – Welcome message\n"
-        "/help – Show available commands\n"
-        "/myid – Get your chat ID\n"
-        "/lt\n/apdinfo\n/mvr\n/sign\n/Rules – Send & pin the rules\n/emails – Contact emails\n"
-        "/ssinfo – Email transcript to your default address\n"
-        "/ssendo – Email transcript to your endorsement address"
+        "🤖 Available commands (AIS TEAM only):\n"
+        "/start – Welcome\n"
+        "/help – This list\n"
+        "/myid – Your chat ID\n"
+        "/rules – Send & pin rules\n"
+        "/lt /apdinfo /mvr /sign /emails – Quick replies\n"
+        "/ssinfo – Email transcript to info@\n"
+        "/ssendo – Email transcript to endorsements@"
     )
 
 @require_authorized
@@ -431,7 +433,7 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @require_authorized
 async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Always post & try to pin (no cooldown on commands)
+    # No cooldown: always post & attempt to pin
     sent = await update.message.reply_text(RULES_MESSAGE, parse_mode="Markdown")
     try:
         await context.bot.pin_chat_message(chat_id=update.effective_chat.id, message_id=sent.message_id, disable_notification=True)
@@ -443,15 +445,14 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
     record_message_for_transcript(update)
     chat_id = str(update.effective_chat.id)
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
-
-    # Commands are allowed everywhere (including SILENT_GROUP_IDS) — ALWAYS reply
+    # Commands are allowed everywhere (including SILENT_GROUP_IDS) — NO cooldown
     if cmd in COMMAND_MESSAGES:
         await update.message.reply_text(COMMAND_MESSAGES[cmd])
-
     # Authorized command counts as an authorized reply → cancel 15-min timer if any
     mark_authorized_reply(chat_id)
     task = PENDING_REMINDER_TASKS.pop(chat_id, None)
     if task and not task.done():
+        logger.info(f"[reminder] authorized command – cancel timer for chat {chat_id}")
         task.cancel()
 
 async def _send_transcript_email(update: Update, to_addr: str):
@@ -518,7 +519,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- COMMAND-ONLY MODE FOR AUTHORIZED GROUPS ---
     if is_silent_chat:
-        # Ignore all regular messages in these chats (commands handled by command handlers)
+        # Stay silent, but if a NON-AUTH user speaks, still arm the 15m reminder
+        if not is_auth:
+            mark_customer_activity(chat_id)
+            schedule_no_reply_reminder(chat_id, context)
         return
 
     # --- DYNAMIC SILENCE for non-silent chats: authorized normal messages don't trigger spiels ---
@@ -526,6 +530,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mark_authorized_reply(chat_id)
         task = PENDING_REMINDER_TASKS.pop(chat_id, None)
         if task and not task.done():
+            logger.info(f"[reminder] authorized talk – cancel timer for chat {chat_id}")
             task.cancel()
         return  # no auto-spiels to authorized talk in non-silent chats
 
@@ -604,10 +609,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not set"); return
-    # Optional: simple env presence log (no secrets)
-    missing = [k for k in ("GMAIL_CLIENT_ID","GMAIL_CLIENT_SECRET","GMAIL_REFRESH_TOKEN","GMAIL_SENDER") if not os.getenv(k)]
-    if missing:
-        logger.warning(f"Gmail env missing: {missing}")
+    if not (GMAIL_SENDER and GMAIL_APP_PASSWORD):
+        logger.warning("⚠️ Missing GMAIL_SENDER or GMAIL_APP_PASSWORD – emails will fail.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -620,8 +623,9 @@ async def main():
     app.add_handler(CommandHandler("ssendo", ssendo_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
+
     asyncio.create_task(last_call_scheduler(app))
-    logger.info("✅ Bot running with command-only authorized groups, dynamic silent mode, **no command cooldown**, 15-min endorsements reminder, and 'Last Call' only to chats active today.")
+    logger.info("✅ Bot running with SMTP emails, command-only authorized groups, no command cooldown, 15-min reminder ({}m), and 'Last Call' only to active chats.".format(REMINDER_MINUTES))
     await app.run_polling()
 
 if __name__ == "__main__":
