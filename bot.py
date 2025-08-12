@@ -84,7 +84,7 @@ WEEKEND_MESSAGE = (
 )
 
 COI_REMINDER = (
-    "📩 For Certificate of Insurance (COI) or certificate requests, please email us at: info@myaisagency.com\n\n"
+    "📩 For Certificate of Insurance (COI) or certificate requests, please email us at: coi@myaisagency.com\n\n"
     "📬 Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
