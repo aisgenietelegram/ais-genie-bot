@@ -139,7 +139,7 @@ EMAILS_MESSAGE = (
 
 COMMAND_MESSAGES = {
     "lt": "📄 Please send us the Lease Termination to proceed with removal. This is required.",
-    "apdinfo": (
+    "apd": (
         "📝 Please send the following details to Pavel@myaisagency.com:\n"
         "- Corporation name\n"
         "- Phone number\n"
@@ -423,8 +423,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/myid – Your chat ID\n"
         "/rules – Send & pin rules\n"
         "/lt /apdinfo /mvr /sign /emails – Quick replies\n"
-        "/ssinfo – Email transcript to info@\n"
-        "/ssendo – Email transcript to endorsements@"
+        "/ssi – Email transcript to info@\n"
+        "/sse – Email transcript to endorsements@"
     )
 
 @require_authorized
@@ -618,9 +618,9 @@ async def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("Rules", rules_command))
     app.add_handler(CommandHandler("rules", rules_command))
-    app.add_handler(CommandHandler(["lt", "apdinfo", "mvr", "sign", "emails"], generic_command_handler))
-    app.add_handler(CommandHandler("ssinfo", ssinfo_command))
-    app.add_handler(CommandHandler("ssendo", ssendo_command))
+    app.add_handler(CommandHandler(["lt", "apd", "mvr", "sign", "emails"], generic_command_handler))
+    app.add_handler(CommandHandler("ssi", ssinfo_command))
+    app.add_handler(CommandHandler("sse", ssendo_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_error_handler(on_error)
 
