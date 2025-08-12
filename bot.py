@@ -6,10 +6,12 @@ from datetime import datetime, time
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Set
 import pytz
-from email.message import EmailMessage
 import base64
 import io
 import textwrap
+import socket
+import smtplib
+from email.message import EmailMessage
 
 from telegram import Update, Chat
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -20,12 +22,6 @@ try:
     PIL_OK = True
 except Exception:
     PIL_OK = False
-
-# Gmail (App Password or OAuth — App Password preferred)
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request as GARequest
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO)
@@ -50,20 +46,16 @@ PREAUTHORIZED_USER_IDS = {int(x) for x in _csv_env("AUTHORIZED_USER_IDS")} if _c
 # Office hours (CT)
 WEEKDAY_START = time(9, 0)
 WEEKDAY_END = time(17, 0)
-WEEKDAY_CUTOFF = time(16, 30)
+WEEKDAY_CUTOFF = time(16, 30)  # 4:30 PM
 LUNCH_START = time(12, 30)
 LUNCH_END = time(13, 30)
 
 # Env vars (NO SECRETS HARDCODED)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Prefer App Password; OAuth kept for backward-compat
+# App Password SMTP (OAuth removed)
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")  # if set, we won't use OAuth below
-
-GMAIL_CLIENT_ID = os.getenv("GMAIL_CLIENT_ID")
-GMAIL_CLIENT_SECRET = os.getenv("GMAIL_CLIENT_SECRET")
-GMAIL_REFRESH_TOKEN = os.getenv("GMAIL_REFRESH_TOKEN")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
 EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
@@ -71,6 +63,9 @@ EMAIL_COI = os.getenv("EMAIL_COI", "coi@myaisagency.com")
 
 # Minutes for the no-reply reminder
 REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "15"))
+
+# Optional simple same-host conflict guard
+CONFLICT_GUARD_PORT = int(os.getenv("CONFLICT_GUARD_PORT", "37219"))
 
 # ---------------- Messages ----------------
 CLOSED_MESSAGE = (
@@ -251,50 +246,45 @@ def is_simple_hello(text: str) -> bool:
     t = text.strip().lower()
     return t in {"hi", "hello", "hey", "yo", "good morning", "good evening", "good afternoon"}
 
-# ---- Gmail helpers ----
-def _gmail_service():
-    """
-    Use App Password if provided. Otherwise fall back to OAuth refresh (legacy).
-    """
-    if GMAIL_APP_PASSWORD:
-        # App Password path uses SMTP via googleapiclient? No — simplest approach:
-        # We'll still use Gmail API with OAuth if available; otherwise recommend SMTP.
-        # To keep your current code behavior, we keep Gmail API. If APP_PASSWORD is set
-        # but OAuth creds are missing, raise a clear error so env is fixed consistently.
-        if not (GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN):
-            raise RuntimeError("Missing OAuth vars. Provide OAuth or switch implementation to SMTP for App Passwords.")
-    creds = Credentials(
-        token=None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=["https://www.googleapis.com/auth/gmail.send"],
-    )
-    creds.refresh(GARequest())
-    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+# ---- Email via SMTP (App Password) ----
+def _send_email_smtp(subject: str, body: str, to_addr: str,
+                     attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None) -> tuple[bool, Optional[str]]:
+    sender = GMAIL_SENDER
+    app_pw = GMAIL_APP_PASSWORD
+    if not sender or not app_pw:
+        return False, "Missing GMAIL_SENDER or GMAIL_APP_PASSWORD"
+
+    try:
+        msg = EmailMessage()
+        msg["From"] = sender
+        msg["To"] = to_addr
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        if attach_bytes and attach_name:
+            # Default to PNG; adjust if needed
+            msg.add_attachment(attach_bytes, maintype="image", subtype="png", filename=attach_name)
+
+        # Gmail SMTP over SSL (465)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender, app_pw)
+            server.send_message(msg)
+
+        return True, None
+    except Exception as e:
+        logger.exception("SMTP send failed")
+        return False, str(e)
 
 async def send_email_async(subject: str, body: str, to_addr: Optional[str] = None,
                            attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None):
     def _send():
-        try:
-            service = _gmail_service()
-            msg = EmailMessage()
-            msg["From"] = GMAIL_SENDER
-            msg["To"] = to_addr or EMAIL_DEFAULT_TO
-            msg["Subject"] = subject
-            msg.set_content(body)
-            if attach_bytes and attach_name:
-                msg.add_attachment(attach_bytes, maintype="image", subtype="png", filename=attach_name)
-            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-            service.users().messages().send(userId="me", body={"raw": raw}).execute()
-            return True, None
-        except HttpError as he:
-            logger.exception("Gmail API error")
-            return False, f"Gmail API error: {he}"
-        except Exception as e:
-            logger.exception("Gmail send failed")
-            return False, str(e)
+        return _send_email_smtp(
+            subject=subject,
+            body=body,
+            to_addr=to_addr or EMAIL_DEFAULT_TO,
+            attach_name=attach_name,
+            attach_bytes=attach_bytes
+        )
     return await asyncio.to_thread(_send)
 
 # ---- Transcript rendering ----
@@ -411,7 +401,6 @@ def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_T
             last_customer = LAST_CUSTOMER_MESSAGE_AT.get(chat_id)
             last_auth = LAST_AUTH_REPLY_AT.get(chat_id)
             if last_customer and (not last_auth or last_auth < last_customer):
-                # Use group title in subject if available
                 chat_title = known_group_chats.get(chat_id, {}).get("title") or "Private Chat"
                 subject = f"[No Reply {REMINDER_MINUTES}m] {chat_title}"
                 body = (
@@ -611,12 +600,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mark_customer_activity(chat_id)
     schedule_no_reply_reminder(chat_id, context)
 
-# ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
+# ---------------- Scheduler: 4:30 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
     while True:
         now = now_in_timezone()
         try:
-            if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 0:
+            # Weekdays only, at 16:30 local time
+            if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 30:
                 today_str = now.strftime("%Y-%m-%d")
                 targets = [cid for cid, d in LAST_CHAT_ACTIVITY.items()
                            if d == today_str and cid not in SILENT_GROUP_IDS]
@@ -634,19 +624,40 @@ async def last_call_scheduler(app):
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error", exc_info=context.error)
 
+def _acquire_conflict_guard(port: int) -> Optional[socket.socket]:
+    """
+    Best-effort same-host guard. If bind fails, another instance likely holds it.
+    Returns the bound socket on success (keep it open), or None on failure.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", port))
+        s.listen(1)
+        logger.info(f"Conflict guard bound on 127.0.0.1:{port}")
+        return s
+    except Exception as e:
+        logger.error(f"Another process appears to be running (conflict guard port {port} busy): {e}")
+        return None
+
 async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not set"); return
 
-    # Optional: simple env presence log (no secrets)
+    # SMTP vars check
     missing = []
-    for k in ("GMAIL_SENDER",):
-        if not os.getenv(k):
-            missing.append(k)
-    if not (GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET and GMAIL_REFRESH_TOKEN):
-        missing.extend(["GMAIL_CLIENT_ID","GMAIL_CLIENT_SECRET","GMAIL_REFRESH_TOKEN"])
+    if not GMAIL_SENDER:
+        missing.append("GMAIL_SENDER")
+    if not GMAIL_APP_PASSWORD:
+        missing.append("GMAIL_APP_PASSWORD")
     if missing:
-        logger.warning(f"Gmail env possibly missing (using API send): {missing}")
+        logger.warning(f"Missing email SMTP env: {missing}")
+
+    # Optional conflict guard (same-host only)
+    guard_sock = _acquire_conflict_guard(CONFLICT_GUARD_PORT)
+    if guard_sock is None:
+        logger.error("Exiting due to conflict guard.")
+        return
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -669,7 +680,7 @@ async def main():
     # Kick off last-call scheduler
     asyncio.create_task(last_call_scheduler(app))
 
-    logger.info("✅ Bot running: command-only authorized groups, dynamic silent mode, NO cooldown for commands, /ssi /sse /ssc transcript emailers, 15-min endorsements reminder with chat title in subject, and 'Last Call' only to active chats.")
+    logger.info("✅ Bot running: App Password SMTP email, command-only authorized groups, dynamic silent mode, NO cooldown for commands, /ssi /sse /ssc transcript emailers, 15-min endorsements reminder with chat title in subject, and 'Last Call' 4:30 PM CT on weekdays (active chats only).")
     await app.run_polling()
 
 if __name__ == "__main__":
