@@ -380,7 +380,7 @@ def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_T
             last_auth = LAST_AUTH_REPLY_AT.get(chat_id)
             logger.info(f"[reminder] fired for chat {chat_id} | last_customer={last_customer} last_auth={last_auth}")
             if last_customer and (not last_auth or last_auth < last_customer):
-                subject = f"[No Reply {REMINDER_MINUTES}m] Chat {chat_id}"
+                subject = f"[No Reply {REMINDER_MINUTES}m] {known_group_chats.get(chat_id, {}).get('title', chat_id)}"
                 body = (
                     f"No authorized reply in chat {chat_id} for {REMINDER_MINUTES} minutes after a customer message.\n"
                     f"Time (local): {now_in_timezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
