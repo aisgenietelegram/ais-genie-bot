@@ -91,7 +91,7 @@ WEEKEND_MESSAGE = (
 
 COI_TEXT = (
     "📩 *Certificate of Insurance (COI) / Certificates*\n\n"
-    "Please email: **info@myaisagency.com**\n\n"
+    "Please email: **coi@myaisagency.com**\n\n"
     "Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
@@ -137,7 +137,7 @@ LUNCH_MESSAGE = (
 
 EMAILS_MESSAGE = (
     "📧 *PLEASE USE THE FOLLOWING EMAILS TO GET YOUR REQUEST PROCESSED ASAP:*\n\n"
-    f"• {EMAIL_COI or 'coi@myaisagency.com'} – COI / Certificates\n"
+    f"• {EMAIL_COI or 'coi@myaisagency.com'} – COI / Certificates / Lists\n"
     f"• {EMAIL_DEFAULT_TO or 'info@myaisagency.com'} – General Questions / Binding\n"
     f"• {EMAIL_ENDORSEMENT or 'endorsements@myaisagency.com'} – Policy changes / quotes / driver & truck list\n"
     "• claims@myaisagency.com – Claims"
