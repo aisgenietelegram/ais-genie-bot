@@ -1,12 +1,10 @@
 import os
-import json
 import logging
 import asyncio
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Set
 import pytz
-import base64
 import io
 import textwrap
 import socket
@@ -47,6 +45,7 @@ PREAUTHORIZED_USER_IDS = {int(x) for x in _csv_env("AUTHORIZED_USER_IDS")} if _c
 WEEKDAY_START = time(9, 0)
 WEEKDAY_END = time(17, 0)
 WEEKDAY_CUTOFF = time(16, 30)  # 4:30 PM
+LAST_CALL_TIME = time(16, 0)   # 4:00 PM
 LUNCH_START = time(12, 30)
 LUNCH_END = time(13, 30)
 
@@ -61,92 +60,87 @@ EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
 EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
 EMAIL_COI = os.getenv("EMAIL_COI", "coi@myaisagency.com")
 
-# Minutes for the no-reply reminder
-REMINDER_MINUTES = int(os.getenv("REMINDER_MINUTES", "15"))
-
 # Optional simple same-host conflict guard
 CONFLICT_GUARD_PORT = int(os.getenv("CONFLICT_GUARD_PORT", "37219"))
 
 # ---------------- Messages ----------------
-CLOSED_MESSAGE = (
-    "⏰ Our agency is currently closed.\n\n"
-    "Business Hours:\n"
-    "🕘 Monday to Friday: 9:00 AM – 5:00 PM\n"
-    "🛑 Saturday & Sunday: Closed\n\n"
-    "⚠️ Your endorsement request was not processed.\n"
-    "Please reach out during business hours so it wont be overlooked. Thank you!"
+CLOSED_MESSAGE_AM = (
+    "🌅 Good morning!\n"
+    "Our office opens at 9:00 AM CT.\n\n"
+    "📌 Please resend your request after we open so we can handle it promptly.\n"
+    "Thank you for your patience! 🙏"
+)
+
+CLOSED_MESSAGE_PM = (
+    "🌙 Our office is now closed for the day.\n"
+    "We’ll be back tomorrow at 9:00 AM CT.\n\n"
+    "📌 Requests sent after hours will be handled on the next business day.\n"
+    "Thank you for your understanding! 🙏"
 )
 
 AFTER_CUTOFF_MESSAGE = (
-    "⚠️ Sorry, your endorsement was received outside the cutoff period.\n\n"
-    "It will be processed the next business day. Thank you for your understanding!"
+    "⚠️ Sorry, your **Request** was received outside the cut-off period.\n\n"
+    "It will be processed on the next business day. Thank you for your understanding!"
 )
 
 WEEKEND_MESSAGE = (
-    "Thank you for reaching out. 😉\n\n"
-    "🔒 We’re currently closed for the weekend (Saturday & Sunday). Our office will resume regular hours on Monday at 9:00 a.m.\n\n"
-    "⚠️ Please note that your request was not processed, and we kindly ask that you resend it Monday morning to ensure it’s handled promptly.\n\n"
-    "Thank you for your understanding! 🤗"
+    "🌙 We’re closed on weekends (Sat–Sun).\n"
+    "We’ll be back Monday at 9:00 AM CT.\n"
+    "Please resend your request then so we don’t miss it. Thank you! 🙏"
 )
 
-COI_REMINDER = (
-    "📩 For Certificate of Insurance (COI) or certificate requests, please email us at: info@myaisagency.com\n\n"
-    "📬 Kindly include:\n"
+COI_TEXT = (
+    "📩 *Certificate of Insurance (COI) / Certificates*\n\n"
+    "Please email: **info@myaisagency.com**\n\n"
+    "Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
     "• Any special wording or instructions\n"
-    "• The email address where we should send the certificate\n\n"
-    "This helps us process your request securely and efficiently. Thank you!"
+    "• The email address where we should send the certificate\n"
 )
 
 RULES_MESSAGE = (
-    "📜 *Advanced Insurance Solutions Telegram Rules*\n\n"
-    "‼️ IF THE CHANGE WAS NOT CONFIRMED OVER EMAIL, IT DID NOT HAPPEN.\n"
-    "⏳ Please allow 10–15 minutes for a response.\n\n"
-    "🔹 Telegram is for communication only. Policy changes must be confirmed by email.\n\n"
-    "📌 *Guidelines:*\n"
-    "1. All COI requests must be emailed to coi@myaisagency.com\n"
-    "2. No editing of posts\n"
-    "3. Do not reply to old posts — Kindly resend the request instead\n"
-    "4. Don’t send photos of VINs — type Year, Make, and VIN\n"
-    "_Use this format for policy changes:_\n"
-    "• Remove VIN: 4V4NC9TH5KN216424\n"
-    "• Add VIN: 1FUJHHDR3LLLH8454\n"
-    "• Remove driver: Phillip Moore\n"
-    "• Add driver: RUBENS ESTIME\n"
-    "5. If your policy requires MVR, attach it. If not, we’ll order one and charge $30\n"
-    "6. Send CDL with driver’s name clearly\n"
-    "7. We don’t work weekends — resend requests on Monday\n"
-    "8. Physical Damage coverage is not automatically added\n"
-    "9. We accept changes Mon–Fri, 9:00 AM–4:30 PM (4:00 PM Friday)\n"
-    "10. No change is valid unless confirmed by email"
+    "📜 *Advanced Insurance Solutions — Chat Guidelines*\n\n"
+    "⚠️ *If a change is not confirmed by email, it did not happen.*\n\n"
+    "*How to Use This Chat*\n"
+    "• Telegram is for quick communication. Policy changes must be confirmed via email.\n"
+    "• Please avoid editing old posts. Start a new message for new requests.\n\n"
+    "*COI (Certificates)*\n"
+    f"• Email: {EMAIL_COI or 'coi@myaisagency.com'}\n"
+    "• Include: holder name, full mailing address, any special wording, and the delivery email.\n\n"
+    "*Driver & Vehicle Changes*\n"
+    "• Type VINs (no photos). Example:\n"
+    "  – Remove VIN: 4V4NC9TH5KN216424\n"
+    "  – Add VIN: 1FUJHHDR3LLLH8454\n"
+    "  – Remove driver: Phillip Moore\n"
+    "  – Add driver: Rubens Estime\n"
+    "• If MVRs are required, attach them. If we order them, a $30 fee applies per MVR.\n"
+    "• Send CDL with driver’s name clearly visible.\n"
+    "• Physical Damage coverage is not automatically added.\n\n"
+    "*Timing*\n"
+    "• We accept changes Mon–Fri, 9:00 AM – 4:30 PM (Last Call 4:00 PM).\n"
+    "• We do not work weekends. Please resend your request Monday.\n\n"
+    "✅ *No change is valid unless confirmed by email.*"
 )
 
 LAST_CALL_MESSAGE = (
-    "📢 *Last Call for Changes!*\n\n"
-    "Please submit any policy changes before our cut-off time:\n"
-    "🗓️ Weekdays: 4:30 PM\n\n"
-    "Changes after this time will be processed the next business day."
+    "📢 *Last Call – 4:30 PM Cut-off*\n\n"
+    "Please send any remaining requests before **4:30 PM CT**.\n"
+    "After that, they’ll be handled the next business day.\n\n"
+    "🔔 *Starting September 1:* This will be strictly enforced. Thank you! 🙏"
 )
 
 LUNCH_MESSAGE = (
     "🍽️ Our team is currently on lunch break (12:30 PM – 1:30 PM CT).\n\n"
-    "We’ll respond once we’re back. To make sure we don’t miss anything, feel free to email us too.\n"
-    "📧 info@myaisagency.com"
+    "We’ll respond once we’re back."
 )
 
 EMAILS_MESSAGE = (
-    "📧 *PLEASE USE THE FOLLOWING EMAIL TO GET YOUR REQUEST PROCESSED ASAP.*\n\n"
-    "• coi@myaisagency.com – For all CERTIFICATES requests please send your request\n"
-    "• Info@myaisagency.com – For general Questions and Binding\n"
-    "• Endorsements@myaisagency.com – For policy CHANGES / QUOTES / DRIVER & TRUCK LIST on an existing policy\n"
-    "• Claims@myaisagency.com – For all CLAIMS related questions and requotes"
-)
-
-# New confirmation quick-reply
-CONFIRM_MESSAGE = (
-    "📧 Kindly check your email, we’ve sent you a message. "
-    "Please confirm once you’ve received it, and feel free to reply here if you have any questions. Thank you! 😊"
+    "📧 *PLEASE USE THE FOLLOWING EMAILS TO GET YOUR REQUEST PROCESSED ASAP:*\n\n"
+    f"• {EMAIL_COI or 'coi@myaisagency.com'} – COI / Certificates\n"
+    f"• {EMAIL_DEFAULT_TO or 'info@myaisagency.com'} – General Questions / Binding\n"
+    f"• {EMAIL_ENDORSEMENT or 'endorsements@myaisagency.com'} – Policy changes / quotes / driver & truck list\n"
+    "• claims@myaisagency.com – Claims"
 )
 
 COMMAND_MESSAGES = {
@@ -173,7 +167,6 @@ COMMAND_MESSAGES = {
         "Thank you! ✍️😊"
     ),
     "emails": EMAILS_MESSAGE,
-    "con": CONFIRM_MESSAGE,
 }
 
 # ---------------- State ----------------
@@ -185,13 +178,19 @@ known_group_chats: Dict[str, Dict[str, Any]] = {}
 # Authorized users (seen in AIS team chats) + preloaded env IDs
 team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
 
-# For 15-minute reminder
-LAST_CUSTOMER_MESSAGE_AT: Dict[str, datetime] = {}
-LAST_AUTH_REPLY_AT: Dict[str, datetime] = {}
-PENDING_REMINDER_TASKS: Dict[str, asyncio.Task] = {}
-
 # Track chats that had activity today (key: chat_id, value: YYYY-MM-DD)
 LAST_CHAT_ACTIVITY: Dict[str, str] = {}
+
+# Once-per-day closed messages, tracked separately for AM(before shift) and PM(after shift)
+CLOSED_SENT_TODAY_AM: Dict[str, str] = {}  # chat_id -> YYYY-MM-DD
+CLOSED_SENT_TODAY_PM: Dict[str, str] = {}  # chat_id -> YYYY-MM-DD
+
+# Track last authorized message timestamp per chat (CT)
+LAST_AUTH_MSG_AT: Dict[str, datetime] = {}
+
+# After-hours suppression window when an authorized user posts (2h), and 1h threshold to allow spiel if non-auth messages
+AFTER_HOURS_SUPPRESSION_WINDOW_HOURS = 2
+AFTER_HOURS_MIN_SILENCE_FOR_SPIEL_HOURS = 1
 
 # ---------------- Helpers ----------------
 def now_in_timezone():
@@ -236,15 +235,9 @@ def record_message_for_transcript(update: Update):
     entry = {
         "ts": datetime.fromtimestamp(msg.date.timestamp(), tz=TIMEZONE).strftime("%Y-%m-%d %I:%M %p"),
         "name": (update.effective_user.full_name or update.effective_user.username or str(update.effective_user.id))[:80],
-        "text": txt.strip()
+        "text": (txt or "").strip()
     }
     chat_buffers[chat_id].append(entry)
-
-def is_simple_hello(text: str) -> bool:
-    if not text:
-        return False
-    t = text.strip().lower()
-    return t in {"hi", "hello", "hey", "yo", "good morning", "good evening", "good afternoon"}
 
 # ---- Email via SMTP (App Password) ----
 def _send_email_smtp(subject: str, body: str, to_addr: str,
@@ -262,7 +255,6 @@ def _send_email_smtp(subject: str, body: str, to_addr: str,
         msg.set_content(body)
 
         if attach_bytes and attach_name:
-            # Default to PNG; adjust if needed
             msg.add_attachment(attach_bytes, maintype="image", subtype="png", filename=attach_name)
 
         # Gmail SMTP over SSL (465)
@@ -369,7 +361,7 @@ def require_authorized(func):
         return await func(update, context)
     return wrapper
 
-def already_sent(chat_id: str, tag: str, window_sec: int = 3600) -> bool:
+def already_sent(chat_id: str, tag: str, window_sec: int = 7200) -> bool:  # 2-hour cooldown per group
     last = chat_last_response.get(chat_id, {})
     when = last.get(tag)
     if not when:
@@ -383,46 +375,57 @@ def already_sent(chat_id: str, tag: str, window_sec: int = 3600) -> bool:
 def mark_sent(chat_id: str, tag: str):
     chat_last_response.setdefault(chat_id, {})[tag] = now_in_timezone().isoformat()
 
-# --- 15-minute reminder helpers ---
-def mark_customer_activity(chat_id: str):
-    LAST_CUSTOMER_MESSAGE_AT[chat_id] = now_in_timezone()
+def set_last_auth_msg(chat_id: str):
+    LAST_AUTH_MSG_AT[chat_id] = now_in_timezone()
 
-def mark_authorized_reply(chat_id: str):
-    LAST_AUTH_REPLY_AT[chat_id] = now_in_timezone()
+def last_auth_msg_age(chat_id: str) -> Optional[timedelta]:
+    ts = LAST_AUTH_MSG_AT.get(chat_id)
+    if not ts:
+        return None
+    return now_in_timezone() - ts
 
-def schedule_no_reply_reminder(chat_id: str, app_context: ContextTypes.DEFAULT_TYPE):
-    task = PENDING_REMINDER_TASKS.get(chat_id)
-    if task and not task.done():
-        task.cancel()
+def within_after_hours_suppression(chat_id: str) -> bool:
+    """
+    Returns True if we are outside business hours AND within 2h since last authorized message in this chat.
+    """
+    open_, _ = is_office_open()
+    if open_:
+        return False
+    age = last_auth_msg_age(chat_id)
+    if age is None:
+        return False
+    return age <= timedelta(hours=AFTER_HOURS_SUPPRESSION_WINDOW_HOURS)
 
-    async def reminder_job():
-        try:
-            await asyncio.sleep(REMINDER_MINUTES * 60)
-            last_customer = LAST_CUSTOMER_MESSAGE_AT.get(chat_id)
-            last_auth = LAST_AUTH_REPLY_AT.get(chat_id)
-            if last_customer and (not last_auth or last_auth < last_customer):
-                chat_title = known_group_chats.get(chat_id, {}).get("title") or "Private Chat"
-                subject = f"[No Reply {REMINDER_MINUTES}m] {chat_title}"
-                body = (
-                    f"No authorized reply in chat {chat_title} for {REMINDER_MINUTES} minutes after a customer message.\n"
-                    f"Chat ID: {chat_id}\n"
-                    f"Time (local): {now_in_timezone().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                )
-                entries = list(chat_buffers.get(chat_id, []))
-                png_bytes = render_transcript_image(chat_title, entries) if entries else None
-                await send_email_async(
-                    subject=subject,
-                    body=body if not png_bytes else (body + "\n(Transcript image attached.)"),
-                    to_addr=EMAIL_ENDORSEMENT,
-                    attach_name=f"no_reply_{chat_id}.png" if png_bytes else None,
-                    attach_bytes=png_bytes
-                )
-        except asyncio.CancelledError:
-            pass
-        finally:
-            PENDING_REMINDER_TASKS.pop(chat_id, None)
+def allow_after_hours_spiel(chat_id: str) -> bool:
+    """
+    Outside business hours:
+    - If within suppression window (2h since last authorized), allow spiel only if >=1h since last authorized.
+    - If not within suppression window, allow spiel normally.
+    """
+    open_, _ = is_office_open()
+    if open_:
+        return False  # only used after-hours
+    age = last_auth_msg_age(chat_id)
+    if age is None:
+        return True
+    if age >= timedelta(hours=AFTER_HOURS_SUPPRESSION_WINDOW_HOURS):
+        return True
+    # within 2h suppression: allow only after 1h
+    return age >= timedelta(hours=AFTER_HOURS_MIN_SILENCE_FOR_SPIEL_HOURS)
 
-    PENDING_REMINDER_TASKS[chat_id] = asyncio.create_task(reminder_job())
+def sent_closed_today(chat_id: str, is_pm: bool) -> bool:
+    today = now_in_timezone().strftime("%Y-%m-%d")
+    if is_pm:
+        return CLOSED_SENT_TODAY_PM.get(chat_id) == today
+    else:
+        return CLOSED_SENT_TODAY_AM.get(chat_id) == today
+
+def mark_closed_sent_today(chat_id: str, is_pm: bool):
+    today = now_in_timezone().strftime("%Y-%m-%d")
+    if is_pm:
+        CLOSED_SENT_TODAY_PM[chat_id] = today
+    else:
+        CLOSED_SENT_TODAY_AM[chat_id] = today
 
 # ---------------- Commands (authorized-only) — NO COOLDOWN ----------------
 @require_authorized
@@ -437,7 +440,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/help – This list\n"
         "/myid – Your chat ID\n"
         "/rules – Send & pin rules\n"
-        "/lt /apd /mvr /sign /emails /con – Quick replies\n"
+        "/lt /apd /mvr /sign /emails – Quick replies\n"
+        "/time /hours – Business hours\n"
+        "/coi – COI instructions\n"
         "/ssi – Email transcript to info@\n"
         "/sse – Email transcript to endorsements@\n"
         "/ssc – Email transcript to coi@"
@@ -463,13 +468,23 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
 
     # Commands allowed everywhere (including SILENT_GROUP_IDS) — NO cooldown
     if cmd in COMMAND_MESSAGES:
-        await update.message.reply_text(COMMAND_MESSAGES[cmd])
+        await update.message.reply_text(COMMAND_MESSAGES[cmd], parse_mode="Markdown")
 
-    # Authorized command counts as an authorized reply → cancel 15-min timer if any
-    mark_authorized_reply(chat_id)
-    task = PENDING_REMINDER_TASKS.pop(chat_id, None)
-    if task and not task.done():
-        task.cancel()
+    set_last_auth_msg(chat_id)  # authorized activity timestamp
+
+@require_authorized
+async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🕒 *Business Hours (CT)*\n"
+        "Mon–Fri: 9:00 AM – 5:00 PM\n"
+        "Lunch: 12:30 PM – 1:30 PM\n"
+        "Weekends: Closed",
+        parse_mode="Markdown"
+    )
+
+@require_authorized
+async def coi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(COI_TEXT, parse_mode="Markdown")
 
 async def _send_transcript_email(update: Update, to_addr: str):
     chat = update.effective_chat
@@ -521,7 +536,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = str(chat.id)
     text_raw = update.message.text or ""
-    text = text_raw.lower()
     now = now_in_timezone()
 
     # Track group + transcript + (maybe) authorize AIS members
@@ -540,74 +554,93 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- COMMAND-ONLY MODE FOR AUTHORIZED GROUPS ---
     if is_silent_chat:
-        # Ignore all regular messages in these chats (commands handled by command handlers)
-        return
+        return  # ignore non-command messages completely
 
-    # --- DYNAMIC SILENCE for non-silent chats: authorized normal messages don't trigger spiels ---
+    # --- Authorized messages: never auto-spiel; record timestamp ---
     if is_auth:
-        mark_authorized_reply(chat_id)
-        task = PENDING_REMINDER_TASKS.pop(chat_id, None)
-        if task and not task.done():
-            task.cancel()
-        return  # no auto-spiels to authorized talk in non-silent chats
+        set_last_auth_msg(chat_id)
+        return  # no auto spiels to authorized talk anywhere
 
     # From here, sender is non-authorized in a non-silent chat.
-    async def send_once(tag: str, msg: str, md: bool = False):
-        if not already_sent(chat_id, tag):
-            if md:
-                await update.message.reply_text(msg, parse_mode="Markdown")
-            else:
-                await update.message.reply_text(msg)
-            mark_sent(chat_id, tag)
 
-    # COI keywords
-    if "coi" in text or "certificate" in text:
-        await send_once("coi", COI_REMINDER)
-        mark_customer_activity(chat_id)
-        schedule_no_reply_reminder(chat_id, context)
-        return
-
-    # Weekend: reply only to simple greetings
+    # Weekend (short + gentle; once per 2h cooldown via already_sent)
     if is_weekend():
-        if is_simple_hello(text_raw):
-            await send_once("weekend_hello", WEEKEND_MESSAGE)
-        mark_customer_activity(chat_id)
-        schedule_no_reply_reminder(chat_id, context)
+        if not already_sent(chat_id, "weekend"):
+            await update.message.reply_text(WEEKEND_MESSAGE)
+            mark_sent(chat_id, "weekend")
         return
 
-    # Lunch
+    # Lunch notice (optional gentle)
     if is_lunch_time():
-        await send_once("lunch", LUNCH_MESSAGE)
-        mark_customer_activity(chat_id)
-        schedule_no_reply_reminder(chat_id, context)
+        if not already_sent(chat_id, "lunch"):
+            await update.message.reply_text(LUNCH_MESSAGE)
+            mark_sent(chat_id, "lunch")
         return
 
-    # Business hours
+    # Open state / cutoff logic
     open_, before_cutoff = is_office_open()
-    if not open_:
-        await send_once("closed", CLOSED_MESSAGE)
-        mark_customer_activity(chat_id)
-        schedule_no_reply_reminder(chat_id, context)
+
+    # If we're between cutoff (4:30) and close (5:00) and an authorized user posted earlier today on or before cutoff,
+    # then suppress cutoff/closed nudges for replies before closing.
+    def authorized_initiated_on_or_before_cutoff_today() -> bool:
+        ts = LAST_AUTH_MSG_AT.get(chat_id)
+        if not ts:
+            return False
+        local_ts = ts.astimezone(TIMEZONE)
+        today_str = now.strftime("%Y-%m-%d")
+        return (
+            local_ts.strftime("%Y-%m-%d") == today_str
+            and local_ts.time() <= WEEKDAY_CUTOFF
+        )
+
+    if open_:
+        # During office hours
+        if not before_cutoff:
+            # Between 4:30 and 5:00 PM
+            if authorized_initiated_on_or_before_cutoff_today():
+                return  # do not interrupt; silent
+            # Otherwise, send a single cutoff nudge per 2h cooldown
+            if not already_sent(chat_id, "cutoff"):
+                await update.message.reply_text(AFTER_CUTOFF_MESSAGE, parse_mode="Markdown")
+                mark_sent(chat_id, "cutoff")
+            return
+        else:
+            # Before cutoff & during open hours -> no auto "message received" (as requested)
+            return
+
+    # After-hours handling (before-shift vs after-shift)
+    is_pm_after_shift = now.time() >= WEEKDAY_END  # >= 5:00 PM
+    is_am_before_shift = now.time() < WEEKDAY_START  # < 9:00 AM
+
+    # Respect the 2h suppression window after any authorized message outside hours.
+    if within_after_hours_suppression(chat_id):
+        # Allow spiel only if it's been >=1h since the last authorized message
+        if not allow_after_hours_spiel(chat_id):
+            return
+
+    # After-hours: send closed spiel once per day for each period (AM or PM)
+    if is_pm_after_shift:
+        if not sent_closed_today(chat_id, is_pm=True):
+            await update.message.reply_text(CLOSED_MESSAGE_PM)
+            mark_closed_sent_today(chat_id, is_pm=True)
         return
-    if not before_cutoff:
-        await send_once("cutoff", AFTER_CUTOFF_MESSAGE)
-        mark_customer_activity(chat_id)
-        schedule_no_reply_reminder(chat_id, context)
+    elif is_am_before_shift:
+        if not sent_closed_today(chat_id, is_pm=False):
+            await update.message.reply_text(CLOSED_MESSAGE_AM)
+            mark_closed_sent_today(chat_id, is_pm=False)
+        return
+    else:
+        # Shouldn't reach here (covers weekends above); safe no-op
         return
 
-    # Normal ack
-    await send_once("normal", "✅ Message received. We’ll take care of it shortly!")
-    mark_customer_activity(chat_id)
-    schedule_no_reply_reminder(chat_id, context)
-
-# ---------------- Scheduler: 4:30 PM CT last call (weekdays, only chats active today) ----------------
+# ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
     while True:
-        now = now_in_timezone()
+        now_local = now_in_timezone()
         try:
-            # Weekdays only, at 16:30 local time
-            if now.weekday() < 5 and now.time().hour == 16 and now.time().minute == 30:
-                today_str = now.strftime("%Y-%m-%d")
+            # Weekdays only, at 16:00 local time
+            if now_local.weekday() < 5 and now_local.time().hour == LAST_CALL_TIME.hour and now_local.time().minute == LAST_CALL_TIME.minute:
+                today_str = now_local.strftime("%Y-%m-%d")
                 targets = [cid for cid, d in LAST_CHAT_ACTIVITY.items()
                            if d == today_str and cid not in SILENT_GROUP_IDS]
                 for chat_id in targets:
@@ -667,7 +700,10 @@ async def main():
     app.add_handler(CommandHandler("myid", myid))
     app.add_handler(CommandHandler("Rules", rules_command))
     app.add_handler(CommandHandler("rules", rules_command))
-    app.add_handler(CommandHandler(["lt", "apd", "mvr", "sign", "emails", "con"], generic_command_handler))
+    app.add_handler(CommandHandler(["lt", "apd", "mvr", "sign", "emails"], generic_command_handler))
+    app.add_handler(CommandHandler("time", time_command))
+    app.add_handler(CommandHandler("hours", time_command))  # alias
+    app.add_handler(CommandHandler("coi", coi_command))
     app.add_handler(CommandHandler("ssi", ssi_command))
     app.add_handler(CommandHandler("sse", sse_command))
     app.add_handler(CommandHandler("ssc", ssc_command))
@@ -680,7 +716,13 @@ async def main():
     # Kick off last-call scheduler
     asyncio.create_task(last_call_scheduler(app))
 
-    logger.info("✅ Bot running: App Password SMTP email, command-only authorized groups, dynamic silent mode, NO cooldown for commands, /ssi /sse /ssc transcript emailers, 15-min endorsements reminder with chat title in subject, and 'Last Call' 4:30 PM CT on weekdays (active chats only).")
+    logger.info(
+        "✅ Bot running: command-only authorized groups; 2h cooldown per group; "
+        "no auto-ack; /time(/hours) and /coi commands; "
+        "Last Call 4:00 PM CT (active chats only); cutoff at 4:30 PM; "
+        "separate AM/PM closed spiels (once/day each); "
+        "after-hours: 2h suppression after authorized posts, spiel allowed after 1h silence."
+    )
     await app.run_polling()
 
 if __name__ == "__main__":
