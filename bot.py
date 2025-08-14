@@ -91,7 +91,7 @@ WEEKEND_MESSAGE = (
 
 COI_TEXT = (
     "📩 *Certificate of Insurance (COI) / Certificates*\n\n"
-    "Please email: **coi@myaisagency.com**\n\n"
+    "Please email: **info@myaisagency.com**\n\n"
     "Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
@@ -137,7 +137,7 @@ LUNCH_MESSAGE = (
 
 EMAILS_MESSAGE = (
     "📧 *PLEASE USE THE FOLLOWING EMAILS TO GET YOUR REQUEST PROCESSED ASAP:*\n\n"
-    f"• {EMAIL_COI or 'coi@myaisagency.com'} – COI / Certificates / Lists\n"
+    f"• {EMAIL_COI or 'coi@myaisagency.com'} – COI / Certificates\n"
     f"• {EMAIL_DEFAULT_TO or 'info@myaisagency.com'} – General Questions / Binding\n"
     f"• {EMAIL_ENDORSEMENT or 'endorsements@myaisagency.com'} – Policy changes / quotes / driver & truck list\n"
     "• claims@myaisagency.com – Claims"
@@ -188,9 +188,20 @@ CLOSED_SENT_TODAY_PM: Dict[str, str] = {}  # chat_id -> YYYY-MM-DD
 # Track last authorized message timestamp per chat (CT)
 LAST_AUTH_MSG_AT: Dict[str, datetime] = {}
 
+# Track last unauthorized message timestamp per chat (CT) for flood buffer
+LAST_UNAUTH_MSG_AT: Dict[str, datetime] = {}
+
+# Pending delayed spiels tasks for AM/PM/Weekend flood buffer
+PENDING_AM_SPIEL: Dict[str, asyncio.Task] = {}
+PENDING_PM_SPIEL: Dict[str, asyncio.Task] = {}
+PENDING_WEEKEND_SPIEL: Dict[str, asyncio.Task] = {}
+
 # After-hours suppression window when an authorized user posts (2h), and 1h threshold to allow spiel if non-auth messages
 AFTER_HOURS_SUPPRESSION_WINDOW_HOURS = 2
 AFTER_HOURS_MIN_SILENCE_FOR_SPIEL_HOURS = 1
+
+# Flood buffer inactivity window
+FLOOD_BUFFER_SECONDS = 5 * 60  # 5 minutes
 
 # ---------------- Helpers ----------------
 def now_in_timezone():
@@ -386,7 +397,7 @@ def last_auth_msg_age(chat_id: str) -> Optional[timedelta]:
 
 def within_after_hours_suppression(chat_id: str) -> bool:
     """
-    Returns True if we are outside business hours AND within 2h since last authorized message in this chat.
+    Returns True if we are outside business hours (incl. weekends) AND within 2h since last authorized message in this chat.
     """
     open_, _ = is_office_open()
     if open_:
@@ -398,7 +409,7 @@ def within_after_hours_suppression(chat_id: str) -> bool:
 
 def allow_after_hours_spiel(chat_id: str) -> bool:
     """
-    Outside business hours:
+    Outside business hours (incl. weekends):
     - If within suppression window (2h since last authorized), allow spiel only if >=1h since last authorized.
     - If not within suppression window, allow spiel normally.
     """
@@ -426,6 +437,100 @@ def mark_closed_sent_today(chat_id: str, is_pm: bool):
         CLOSED_SENT_TODAY_PM[chat_id] = today
     else:
         CLOSED_SENT_TODAY_AM[chat_id] = today
+
+def cancel_task(task: Optional[asyncio.Task]):
+    if task and not task.done():
+        task.cancel()
+
+# Buffer schedulers for AM/PM/Weekend spiels
+def schedule_buffered_spiel(chat_id: str, period: str, context: ContextTypes.DEFAULT_TYPE):
+    """
+    period: 'AM', 'PM', 'WE'
+    Schedules a 5-min buffer before sending the appropriate closed/ weekend spiel,
+    with cancellation rules:
+      - AM: cancel if office opens before fire (>= 9:00 AM)
+      - PM: normal (no cancel for opening)
+      - WE: cancel if the weekend ends and office opens (Mon 9:00 AM)
+    Also respects:
+      - after-hours 2h suppression with 1h threshold
+      - once-per-day per chat (AM/PM); weekend still respects 2h per-chat cooldown tag.
+    """
+    now_local = now_in_timezone()
+    if period == "AM":
+        # once-per-day AM
+        if sent_closed_today(chat_id, is_pm=False):
+            return
+        # cancel any existing AM timer, then schedule
+        cancel_task(PENDING_AM_SPIEL.get(chat_id))
+
+        async def am_job():
+            try:
+                await asyncio.sleep(FLOOD_BUFFER_SECONDS)
+                # If office opened, cancel (do not send)
+                open_, _ = is_office_open()
+                if open_:
+                    return
+                # Suppression: only allow after-hours spiel if allowed
+                if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
+                    return
+                await context.bot.send_message(chat_id=int(chat_id), text=CLOSED_MESSAGE_AM)
+                mark_closed_sent_today(chat_id, is_pm=False)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                PENDING_AM_SPIEL.pop(chat_id, None)
+
+        PENDING_AM_SPIEL[chat_id] = asyncio.create_task(am_job())
+
+    elif period == "PM":
+        if sent_closed_today(chat_id, is_pm=True):
+            return
+        cancel_task(PENDING_PM_SPIEL.get(chat_id))
+
+        async def pm_job():
+            try:
+                await asyncio.sleep(FLOOD_BUFFER_SECONDS)
+                # Still after-hours?
+                now_pm = now_in_timezone().time() >= WEEKDAY_END or is_weekend()
+                if not now_pm:
+                    return
+                if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
+                    return
+                await context.bot.send_message(chat_id=int(chat_id), text=CLOSED_MESSAGE_PM)
+                mark_closed_sent_today(chat_id, is_pm=True)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                PENDING_PM_SPIEL.pop(chat_id, None)
+
+        PENDING_PM_SPIEL[chat_id] = asyncio.create_task(pm_job())
+
+    else:  # 'WE' weekend
+        # Use 2h cooldown tag for weekend; plus buffer
+        if already_sent(chat_id, "weekend"):
+            return
+        cancel_task(PENDING_WEEKEND_SPIEL.get(chat_id))
+
+        async def we_job():
+            try:
+                await asyncio.sleep(FLOOD_BUFFER_SECONDS)
+                # Cancel if not weekend anymore, or office is open (Mon 9am)
+                if not is_weekend():
+                    # If it's Monday before 9, it's AM-beforeshift; let AM handler cover.
+                    return
+                open_, _ = is_office_open()
+                if open_:
+                    return
+                if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
+                    return
+                await context.bot.send_message(chat_id=int(chat_id), text=WEEKEND_MESSAGE)
+                mark_sent(chat_id, "weekend")
+            except asyncio.CancelledError:
+                pass
+            finally:
+                PENDING_WEEKEND_SPIEL.pop(chat_id, None)
+
+        PENDING_WEEKEND_SPIEL[chat_id] = asyncio.create_task(we_job())
 
 # ---------------- Commands (authorized-only) — NO COOLDOWN ----------------
 @require_authorized
@@ -466,7 +571,6 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
     chat_id = str(update.effective_chat.id)
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
 
-    # Commands allowed everywhere (including SILENT_GROUP_IDS) — NO cooldown
     if cmd in COMMAND_MESSAGES:
         await update.message.reply_text(COMMAND_MESSAGES[cmd], parse_mode="Markdown")
 
@@ -535,7 +639,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     chat_id = str(chat.id)
-    text_raw = update.message.text or ""
     now = now_in_timezone()
 
     # Track group + transcript + (maybe) authorize AIS members
@@ -552,36 +655,34 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     is_auth = bool(user and is_authorized_user(user.id))
     is_silent_chat = chat_id in SILENT_GROUP_IDS
 
-    # --- COMMAND-ONLY MODE FOR AUTHORIZED GROUPS ---
+    # COMMAND-ONLY MODE FOR AUTHORIZED GROUPS
     if is_silent_chat:
-        return  # ignore non-command messages completely
+        return
 
-    # --- Authorized messages: never auto-spiel; record timestamp ---
+    # Authorized messages: never auto-spiel; record timestamp
     if is_auth:
         set_last_auth_msg(chat_id)
-        return  # no auto spiels to authorized talk anywhere
+        return
 
     # From here, sender is non-authorized in a non-silent chat.
 
-    # Weekend (short + gentle; once per 2h cooldown via already_sent)
+    # Weekend (now buffered + suppression-aware)
     if is_weekend():
-        if not already_sent(chat_id, "weekend"):
-            await update.message.reply_text(WEEKEND_MESSAGE)
-            mark_sent(chat_id, "weekend")
+        # schedule weekend spiel with 5-min flood buffer (and 2h suppression, 1h threshold)
+        schedule_buffered_spiel(chat_id, "WE", context)
         return
 
-    # Lunch notice (optional gentle)
+    # Lunch notice (kept instant and gentle)
     if is_lunch_time():
         if not already_sent(chat_id, "lunch"):
             await update.message.reply_text(LUNCH_MESSAGE)
             mark_sent(chat_id, "lunch")
         return
 
-    # Open state / cutoff logic
+    # Business hours / cutoff handling
     open_, before_cutoff = is_office_open()
 
-    # If we're between cutoff (4:30) and close (5:00) and an authorized user posted earlier today on or before cutoff,
-    # then suppress cutoff/closed nudges for replies before closing.
+    # If between cutoff (4:30) and close (5:00) and an authorized user initiated on/before cutoff today, suppress nudges
     def authorized_initiated_on_or_before_cutoff_today() -> bool:
         ts = LAST_AUTH_MSG_AT.get(chat_id)
         if not ts:
@@ -594,44 +695,32 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     if open_:
-        # During office hours
         if not before_cutoff:
-            # Between 4:30 and 5:00 PM
+            # 4:30–5:00 PM
             if authorized_initiated_on_or_before_cutoff_today():
-                return  # do not interrupt; silent
-            # Otherwise, send a single cutoff nudge per 2h cooldown
+                return
             if not already_sent(chat_id, "cutoff"):
                 await update.message.reply_text(AFTER_CUTOFF_MESSAGE, parse_mode="Markdown")
                 mark_sent(chat_id, "cutoff")
             return
         else:
-            # Before cutoff & during open hours -> no auto "message received" (as requested)
+            # Before cutoff during open hours → stay silent (no auto-ack)
             return
 
-    # After-hours handling (before-shift vs after-shift)
+    # After-hours (weekday) — send AM/PM with 5-min buffer and suppression awareness
     is_pm_after_shift = now.time() >= WEEKDAY_END  # >= 5:00 PM
     is_am_before_shift = now.time() < WEEKDAY_START  # < 9:00 AM
 
     # Respect the 2h suppression window after any authorized message outside hours.
-    if within_after_hours_suppression(chat_id):
-        # Allow spiel only if it's been >=1h since the last authorized message
-        if not allow_after_hours_spiel(chat_id):
-            return
-
-    # After-hours: send closed spiel once per day for each period (AM or PM)
+    # The schedule_buffered_spiel itself will re-check suppression at fire time.
     if is_pm_after_shift:
-        if not sent_closed_today(chat_id, is_pm=True):
-            await update.message.reply_text(CLOSED_MESSAGE_PM)
-            mark_closed_sent_today(chat_id, is_pm=True)
+        schedule_buffered_spiel(chat_id, "PM", context)
         return
     elif is_am_before_shift:
-        if not sent_closed_today(chat_id, is_pm=False):
-            await update.message.reply_text(CLOSED_MESSAGE_AM)
-            mark_closed_sent_today(chat_id, is_pm=False)
+        schedule_buffered_spiel(chat_id, "AM", context)
         return
     else:
-        # Shouldn't reach here (covers weekends above); safe no-op
-        return
+        return  # Safety no-op
 
 # ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
@@ -720,8 +809,8 @@ async def main():
         "✅ Bot running: command-only authorized groups; 2h cooldown per group; "
         "no auto-ack; /time(/hours) and /coi commands; "
         "Last Call 4:00 PM CT (active chats only); cutoff at 4:30 PM; "
-        "separate AM/PM closed spiels (once/day each); "
-        "after-hours: 2h suppression after authorized posts, spiel allowed after 1h silence."
+        "AM/PM/Weekend spiels use 5-min flood buffer (cancel AM if opening starts); "
+        "after-hours: 2h suppression after authorized posts with 1h silence threshold."
     )
     await app.run_polling()
 
