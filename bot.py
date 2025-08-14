@@ -91,7 +91,7 @@ WEEKEND_MESSAGE = (
 
 COI_TEXT = (
     "📩 *Certificate of Insurance (COI) / Certificates*\n\n"
-    "Please email: **info@myaisagency.com**\n\n"
+    "Please email: **coi@myaisagency.com**\n\n"
     "Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
