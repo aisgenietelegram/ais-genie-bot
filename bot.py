@@ -182,18 +182,18 @@ team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
 LAST_CHAT_ACTIVITY: Dict[str, str] = {}
 
 # Once-per-day closed messages, tracked separately for AM(before shift) and PM(after shift)
-CLOSED_SENT_TODAY_AM: Dict[str, str] = {}  # chat_id -> YYYY-MM-DD
-CLOSED_SENT_TODAY_PM: Dict[str, str] = {}  # chat_id -> YYYY-MM-DD
+CLOSED_SENT_TODAY_AM: Dict[str, str] = {}  # group chat_id -> YYYY-MM-DD
+CLOSED_SENT_TODAY_PM: Dict[str, str] = {}  # group chat_id -> YYYY-MM-DD
 
 # Track last authorized message timestamp per chat (CT)
 LAST_AUTH_MSG_AT: Dict[str, datetime] = {}
 
+# Flood buffer inactivity window
+FLOOD_BUFFER_SECONDS = 5 * 60  # 5 minutes
+
 # After-hours suppression window when an authorized user posts (2h), and 1h threshold to allow spiel if non-auth messages
 AFTER_HOURS_SUPPRESSION_WINDOW_HOURS = 2
 AFTER_HOURS_MIN_SILENCE_FOR_SPIEL_HOURS = 1
-
-# Flood buffer inactivity window
-FLOOD_BUFFER_SECONDS = 5 * 60  # 5 minutes
 
 # --------------- Debounce tokens & task registry ---------------
 # We key by (chat_id, period) where period in {"AM","PM","WE","LUNCH","CUTOFF"}
@@ -358,6 +358,39 @@ def render_transcript_image(chat_title: str, entries: deque) -> Optional[bytes]:
     img.save(buf, format="PNG")
     return buf.getvalue()
 
+# ---------------- Debounce helpers ----------------
+def _period_key(chat_id: str, period: str) -> Tuple[str, str]:
+    return (chat_id, period)
+
+def _new_token() -> str:
+    return now_in_timezone().isoformat()
+
+def _set_debounce(chat_id: str, period: str) -> str:
+    key = _period_key(chat_id, period)
+    token = _new_token()
+    DEBOUNCE_TOKEN[key] = token
+    task = PENDING_TASK.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+    return token
+
+def _is_latest_token(chat_id: str, period: str, token: str) -> bool:
+    return DEBOUNCE_TOKEN.get(_period_key(chat_id, period)) == token
+
+def _clear_debounce(chat_id: str, period: str):
+    key = _period_key(chat_id, period)
+    PENDING_TASK.pop(key, None)
+
+def cancel_all_pending_for_chat(chat_id: str):
+    """Cancel ALL pending buffered prompts for this chat (AM/PM/WE/LUNCH/CUTOFF)."""
+    for period in ("AM", "PM", "WE", "LUNCH", "CUTOFF"):
+        key = _period_key(chat_id, period)
+        task = PENDING_TASK.pop(key, None)
+        if task and not task.done():
+            task.cancel()
+        # bump token so any stray task that still wakes up will no-op
+        DEBOUNCE_TOKEN[key] = _new_token()
+
 # ---------------- Authorization + cooldown helpers ----------------
 def require_authorized(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -393,9 +426,7 @@ def last_auth_msg_age(chat_id: str) -> Optional[timedelta]:
     return now_in_timezone() - ts
 
 def within_after_hours_suppression(chat_id: str) -> bool:
-    """
-    Returns True if we are outside business hours (incl. weekends) AND within 2h since last authorized message in this chat.
-    """
+    """Outside business hours (incl. weekends) AND within 2h since last authorized message in this chat."""
     open_, _ = is_office_open()
     if open_:
         return False
@@ -405,70 +436,36 @@ def within_after_hours_suppression(chat_id: str) -> bool:
     return age <= timedelta(hours=AFTER_HOURS_SUPPRESSION_WINDOW_HOURS)
 
 def allow_after_hours_spiel(chat_id: str) -> bool:
-    """
-    Outside business hours (incl. weekends):
-    - If within suppression window (2h since last authorized), allow spiel only if >=1h since last authorized.
-    - If not within suppression window, allow spiel normally.
-    """
+    """Outside hours: if within 2h suppression, allow only after 1h silence; else allow."""
     open_, _ = is_office_open()
     if open_:
-        return False  # only used after-hours
+        return False
     age = last_auth_msg_age(chat_id)
     if age is None:
         return True
     if age >= timedelta(hours=AFTER_HOURS_SUPPRESSION_WINDOW_HOURS):
         return True
-    # within 2h suppression: allow only after 1h
     return age >= timedelta(hours=AFTER_HOURS_MIN_SILENCE_FOR_SPIEL_HOURS)
-
-def _period_key(chat_id: str, period: str) -> Tuple[str, str]:
-    return (chat_id, period)
-
-def _new_token() -> str:
-    # High entropy not needed; time-based unique is fine
-    return now_in_timezone().isoformat()
-
-def _set_debounce(chat_id: str, period: str) -> str:
-    key = _period_key(chat_id, period)
-    token = _new_token()
-    DEBOUNCE_TOKEN[key] = token
-    # Cancel previous task if any
-    task = PENDING_TASK.pop(key, None)
-    if task and not task.done():
-        task.cancel()
-    return token
-
-def _is_latest_token(chat_id: str, period: str, token: str) -> bool:
-    return DEBOUNCE_TOKEN.get(_period_key(chat_id, period)) == token
-
-def _clear_debounce(chat_id: str, period: str):
-    key = _period_key(chat_id, period)
-    PENDING_TASK.pop(key, None)
-    # keep token so later tasks know they are stale
 
 # --------------- Buffered scheduling for all prompts ---------------
 async def _buffer_then_send(chat_id: str, period: str, token: str, context: ContextTypes.DEFAULT_TYPE):
-    """
-    period in {"AM","PM","WE","LUNCH","CUTOFF"}
-    Applies 5-min buffer; validates window at fire time; respects suppression and once-per-day where applicable.
-    """
+    """period in {"AM","PM","WE","LUNCH","CUTOFF"}"""
     try:
         await asyncio.sleep(FLOOD_BUFFER_SECONDS)
-        # Debounce check
         if not _is_latest_token(chat_id, period, token):
             return
 
         now_local = now_in_timezone()
-        # Window checks per period
+        # Window checks & sending
         if period == "AM":
-            # Cancel if office opened
             open_, _ = is_office_open()
             if open_:
                 return
-            # Once-per-day AM
+            # Only for group chats
+            if chat_id not in known_group_chats:
+                return
             if CLOSED_SENT_TODAY_AM.get(chat_id) == now_local.strftime("%Y-%m-%d"):
                 return
-            # Suppression gate
             if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
                 return
             await context.bot.send_message(chat_id=int(chat_id), text=CLOSED_MESSAGE_AM)
@@ -476,10 +473,11 @@ async def _buffer_then_send(chat_id: str, period: str, token: str, context: Cont
             return
 
         if period == "PM":
-            # Must still be after shift (or weekend night)
-            if is_office_open():
+            open_, _ = is_office_open()
+            if open_:
                 return
-            # Once-per-day PM
+            if chat_id not in known_group_chats:
+                return
             if CLOSED_SENT_TODAY_PM.get(chat_id) == now_local.strftime("%Y-%m-%d"):
                 return
             if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
@@ -489,38 +487,39 @@ async def _buffer_then_send(chat_id: str, period: str, token: str, context: Cont
             return
 
         if period == "WE":
-            # Still weekend and office not open
             if not is_weekend():
                 return
             open_, _ = is_office_open()
             if open_:
                 return
+            if chat_id not in known_group_chats:
+                return
             if within_after_hours_suppression(chat_id) and not allow_after_hours_spiel(chat_id):
                 return
-            # Use a 2h cooldown tag for weekend to avoid spam
             if not already_sent(chat_id, "weekend", window_sec=7200):
                 await context.bot.send_message(chat_id=int(chat_id), text=WEEKEND_MESSAGE)
                 mark_sent(chat_id, "weekend")
             return
 
         if period == "LUNCH":
-            # Still in lunch window?
             t = now_local.time()
             if not (LUNCH_START <= t <= LUNCH_END):
                 return
-            # 2h cooldown
+            if chat_id not in known_group_chats:
+                return
             if not already_sent(chat_id, "lunch"):
                 await context.bot.send_message(chat_id=int(chat_id), text=LUNCH_MESSAGE)
                 mark_sent(chat_id, "lunch")
             return
 
         if period == "CUTOFF":
-            # Still within 4:30–5:00 and business open
             t = now_local.time()
             open_, before_cutoff = is_office_open()
             if not open_ or t < WEEKDAY_CUTOFF or t > WEEKDAY_END:
                 return
-            # If authorized initiated on/before cutoff today, suppress
+            if chat_id not in known_group_chats:
+                return
+            # Suppress if an authorized user initiated on/before cutoff today
             ts = LAST_AUTH_MSG_AT.get(chat_id)
             if ts:
                 ts_local = ts.astimezone(TIMEZONE)
@@ -537,10 +536,7 @@ async def _buffer_then_send(chat_id: str, period: str, token: str, context: Cont
         _clear_debounce(chat_id, period)
 
 def schedule_buffered(chat_id: str, period: str, context: ContextTypes.DEFAULT_TYPE):
-    """
-    period in {"AM","PM","WE","LUNCH","CUTOFF"}
-    Creates/refreshes a single timer using a debounce token so only the latest fires.
-    """
+    """Create/refresh a single timer using a debounce token so only the latest fires."""
     token = _set_debounce(chat_id, period)
     key = _period_key(chat_id, period)
     PENDING_TASK[key] = asyncio.create_task(_buffer_then_send(chat_id, period, token, context))
@@ -549,7 +545,6 @@ def schedule_buffered(chat_id: str, period: str, context: ContextTypes.DEFAULT_T
 def require_and_record(func):
     @require_authorized
     async def inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # record transcript too
         record_message_for_transcript(update)
         return await func(update, context)
     return inner
@@ -594,6 +589,8 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(COMMAND_MESSAGES[cmd], parse_mode="Markdown")
     # Authorized activity timestamp (used for after-hours suppression)
     set_last_auth_msg(chat_id)
+    # NEW: cancel any pending buffered prompts when an authorized user speaks
+    cancel_all_pending_for_chat(chat_id)
 
 @require_and_record
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -660,7 +657,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(chat.id)
     now = now_in_timezone()
 
-    # Track group + transcript + (maybe) authorize AIS members
+    # Track groups + transcript + (maybe) authorize AIS members
     if chat.type in (Chat.GROUP, Chat.SUPERGROUP):
         if chat_id not in known_group_chats:
             known_group_chats[chat_id] = {"title": chat.title or "", "added_on": now.isoformat()}
@@ -668,31 +665,35 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     maybe_record_team_member(update)
     record_message_for_transcript(update)
 
-    # Mark this chat as active today
+    # Mark this chat as active today (any chat)
     LAST_CHAT_ACTIVITY[chat_id] = now.strftime("%Y-%m-%d")
 
     is_auth = bool(user and is_authorized_user(user.id))
     is_silent_chat = chat_id in SILENT_GROUP_IDS
+    is_group = chat.type in (Chat.GROUP, Chat.SUPERGROUP)
 
     # COMMAND-ONLY MODE FOR AUTHORIZED GROUPS
     if is_silent_chat:
         return
 
-    # Authorized messages: never auto-spiel; record timestamp
+    # Authorized messages: never auto-spiel; cancel any pending buffers; record timestamp
     if is_auth:
         set_last_auth_msg(chat_id)
+        cancel_all_pending_for_chat(chat_id)  # <<< cancel 5-min buffers immediately
         return
 
-    # From here, sender is non-authorized in a non-silent chat.
+    # From here, sender is non-authorized.
 
-    # Weekend: schedule buffered weekend spiel (uses suppression + buffer + cancel if Monday 9am)
+    # Weekend: only act in group chats
     if is_weekend():
-        schedule_buffered(chat_id, "WE", context)
+        if is_group:
+            schedule_buffered(chat_id, "WE", context)
         return
 
-    # Lunch: schedule buffered lunch spiel; cancels if lunch window ends before fire
+    # Lunch: only act in group chats
     if is_lunch_time():
-        schedule_buffered(chat_id, "LUNCH", context)
+        if is_group:
+            schedule_buffered(chat_id, "LUNCH", context)
         return
 
     # Business hours / cutoff handling
@@ -708,27 +709,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if open_:
         if not before_cutoff:
-            # 4:30–5:00 PM window: use buffered cutoff spiel unless authorized initiated on/before cutoff
-            if authorized_initiated_on_or_before_cutoff_today():
-                return
-            schedule_buffered(chat_id, "CUTOFF", context)
+            # 4:30–5:00 PM: only in groups; buffer cutoff unless authorized initiated on/before cutoff
+            if is_group:
+                if not authorized_initiated_on_or_before_cutoff_today():
+                    schedule_buffered(chat_id, "CUTOFF", context)
             return
         else:
-            # Before cutoff during open hours → stay silent (no auto-ack)
-            return
+            return  # before cutoff during open hours → stay silent
 
-    # After-hours (weekday): schedule AM or PM buffered spiels (respect suppression & once-per-day)
+    # After-hours (weekday): only in groups, schedule AM/PM
     is_pm_after_shift = now.time() >= WEEKDAY_END  # >= 5:00 PM
     is_am_before_shift = now.time() < WEEKDAY_START  # < 9:00 AM
 
-    if is_pm_after_shift:
-        schedule_buffered(chat_id, "PM", context)
-        return
-    elif is_am_before_shift:
-        schedule_buffered(chat_id, "AM", context)
-        return
-    else:
-        return  # Safety no-op
+    if is_group:
+        if is_pm_after_shift:
+            schedule_buffered(chat_id, "PM", context)
+        elif is_am_before_shift:
+            schedule_buffered(chat_id, "AM", context)
+    return
 
 # ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
 async def last_call_scheduler(app):
@@ -755,10 +753,6 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.exception("Unhandled error", exc_info=context.error)
 
 def _acquire_conflict_guard(port: int) -> Optional[socket.socket]:
-    """
-    Best-effort same-host guard. If bind fails, another instance likely holds it.
-    Returns the bound socket on success (keep it open), or None on failure.
-    """
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -817,9 +811,9 @@ async def main():
         "✅ Bot running: command-only authorized groups; 2h cooldown per group; "
         "no auto-ack; /time(/hours) and /coi commands; "
         "Last Call 4:00 PM CT (active chats only); cutoff at 4:30 PM; "
-        "ALL auto prompts use 5-min flood buffer (AM cancels at opening; lunch/cutoff/weekend cancel if window over); "
+        "ALL auto prompts use 5-min flood buffer (cancelled if an authorized user speaks; AM cancels at opening); "
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
-        "AM/PM spiels once per day per chat with strong debouncing."
+        "AM/PM spiels once per day per *group chat* with strong debouncing."
     )
     await app.run_polling()
 
