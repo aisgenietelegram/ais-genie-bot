@@ -566,7 +566,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/coi – COI instructions\n"
         "/ssi – Email transcript to info@\n"
         "/sse – Email transcript to endorsements@\n"
-        "/ssc – Email transcript to coi@"
+        "/ssc – Email transcript to coi@\n"
+        "/broadcast – Send one-time announcement to all groups\n"
+        "/broadcastpin – Broadcast and try to pin in all groups"
     )
 
 @require_and_record
@@ -605,6 +607,62 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_and_record
 async def coi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(COI_TEXT, parse_mode="Markdown")
+
+@require_and_record
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /broadcast Your announcement text here
+    Sends to all known group/supergroup chats the bot has seen.
+    """
+    msg = (update.message.text or "").split(" ", 1)
+    if len(msg) < 2 or not msg[1].strip():
+        await update.message.reply_text("Usage:\n/broadcast Your announcement text")
+        return
+
+    text = msg[1].strip()
+    total = 0
+    ok = 0
+    fail = 0
+    for cid, meta in list(known_group_chats.items()):
+        try:
+            await context.bot.send_message(chat_id=int(cid), text=text)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/broadcast failed for chat {cid}: {e}")
+        total += 1
+
+    await update.message.reply_text(f"📣 Broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
+
+@require_and_record
+async def broadcastpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /broadcastpin Your announcement text here
+    Same as /broadcast but pins the message (best-effort).
+    """
+    msg = (update.message.text or "").split(" ", 1)
+    if len(msg) < 2 or not msg[1].strip():
+        await update.message.reply_text("Usage:\n/broadcastpin Your announcement text")
+        return
+
+    text = msg[1].strip()
+    total = 0
+    ok = 0
+    fail = 0
+    for cid, meta in list(known_group_chats.items()):
+        try:
+            sent = await context.bot.send_message(chat_id=int(cid), text=text)
+            try:
+                await context.bot.pin_chat_message(chat_id=int(cid), message_id=sent.message_id, disable_notification=True)
+            except Exception as pe:
+                logger.warning(f"/broadcastpin: pin failed for {cid}: {pe}")
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/broadcastpin failed for chat {cid}: {e}")
+        total += 1
+
+    await update.message.reply_text(f"📌 Broadcast (pinned) done.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
 
 async def _send_transcript_email(update: Update, to_addr: str):
     chat = update.effective_chat
@@ -679,7 +737,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Authorized messages: never auto-spiel; cancel any pending buffers; record timestamp
     if is_auth:
         set_last_auth_msg(chat_id)
-        cancel_all_pending_for_chat(chat_id)  # <<< cancel 5-min buffers immediately
+        cancel_all_pending_for_chat(chat_id)  # cancel 5-min buffers immediately
         return
 
     # From here, sender is non-authorized.
@@ -798,6 +856,8 @@ async def main():
     app.add_handler(CommandHandler("ssi", ssi_command))
     app.add_handler(CommandHandler("sse", sse_command))
     app.add_handler(CommandHandler("ssc", ssc_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
@@ -813,7 +873,8 @@ async def main():
         "Last Call 4:00 PM CT (active chats only); cutoff at 4:30 PM; "
         "ALL auto prompts use 5-min flood buffer (cancelled if an authorized user speaks; AM cancels at opening); "
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
-        "AM/PM spiels once per day per *group chat* with strong debouncing."
+        "AM/PM spiels once per day per *group chat* with strong debouncing; "
+        "broadcast commands available to reach all known groups."
     )
     await app.run_polling()
 
