@@ -1,15 +1,17 @@
 import os
+import re
 import logging
 import asyncio
 from datetime import datetime, time, timedelta
 from collections import deque, defaultdict
-from typing import Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, Optional, Set, Tuple, List
 import pytz
 import io
 import textwrap
 import socket
-import smtplib
-from email.message import EmailMessage
+import base64
+
+import httpx  # SendGrid HTTPS API
 
 from telegram import Update, Chat
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
@@ -52,9 +54,9 @@ LUNCH_END = time(13, 30)
 # Env vars (NO SECRETS HARDCODED)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# App Password SMTP (OAuth removed)
-GMAIL_SENDER = os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
+# Email config (SendGrid)
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")  # <<< set this in Railway
+FROM_EMAIL = os.getenv("FROM_EMAIL", os.getenv("GMAIL_SENDER", "aisgenie.telegram@gmail.com"))
 
 EMAIL_DEFAULT_TO = os.getenv("EMAIL_TO", "info@myaisagency.com")
 EMAIL_ENDORSEMENT = os.getenv("EMAIL_ENDORSEMENT", "endorsements@myaisagency.com")
@@ -69,11 +71,14 @@ CLOSED_MESSAGE_AM = (
     "Our office opens at 9:00 AM CT.\n\n"
     "📌 Please resend your request after we open so we can handle it promptly.\n"
     "Thank you for your patience! 🙏"
+    "📌 Requests sent after hours will be handled on the next business day.\n"
+    "Thank you for your understanding! 🙏"
 )
 
 CLOSED_MESSAGE_PM = (
     "🌙 Our office is now closed for the day.\n"
     "We’ll be back tomorrow at 9:00 AM CT.\n\n"
+    "📌 Please resend your request after we open so we can handle it promptly.\n"
     "📌 Requests sent after hours will be handled on the next business day.\n"
     "Thank you for your understanding! 🙏"
 )
@@ -91,7 +96,7 @@ WEEKEND_MESSAGE = (
 
 COI_TEXT = (
     "📩 *Certificate of Insurance (COI) / Certificates*\n\n"
-    "Please email: **coi@myaisagency.com**\n\n"
+    f"Please email: **{EMAIL_COI or 'coi@myaisagency.com'}**\n\n"
     "Kindly include:\n"
     "• COI holder’s name\n"
     "• Complete mailing address\n"
@@ -127,7 +132,10 @@ LAST_CALL_MESSAGE = (
     "📢 *Last Call – 4:30 PM Cut-off*\n\n"
     "Please send any remaining requests before **4:30 PM CT**.\n"
     "After that, they’ll be handled the next business day.\n\n"
+    "📌 Please resend your request after we open so we can handle it promptly.\n"
     "🔔 *Starting September 1:* This will be strictly enforced. Thank you! 🙏"
+    "📌 Requests sent after hours will be handled on the next business day.\n"
+    "Thank you for your understanding! 🙏"
 )
 
 LUNCH_MESSAGE = (
@@ -247,38 +255,48 @@ def record_message_for_transcript(update: Update):
     }
     chat_buffers[chat_id].append(entry)
 
-# ---- Email via SMTP (App Password) ----
-def _send_email_smtp(subject: str, body: str, to_addr: str,
-                     attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None) -> tuple[bool, Optional[str]]:
-    sender = GMAIL_SENDER
-    app_pw = GMAIL_APP_PASSWORD
-    if not sender or not app_pw:
-        return False, "Missing GMAIL_SENDER or GMAIL_APP_PASSWORD"
+# ---- Email via SendGrid HTTPS API ----
+def _send_email_sendgrid(subject: str, body: str, to_addr: str,
+                         attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None) -> tuple[bool, Optional[str]]:
+    """
+    Sends email via SendGrid API (HTTPS).
+    Returns (ok, error_message_if_any).
+    """
+    api_key = SENDGRID_API_KEY
+    if not api_key:
+        return False, "Missing SENDGRID_API_KEY"
+    from_email = FROM_EMAIL
+    if not from_email:
+        return False, "Missing FROM_EMAIL"
+
+    data = {
+        "personalizations": [{"to": [{"email": to_addr}]}],
+        "from": {"email": from_email},
+        "subject": subject or "",
+        "content": [{"type": "text/plain", "value": body or ""}],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
 
     try:
-        msg = EmailMessage()
-        msg["From"] = sender
-        msg["To"] = to_addr
-        msg["Subject"] = subject
-        msg.set_content(body)
-
-        if attach_bytes and attach_name:
-            msg.add_attachment(attach_bytes, maintype="image", subtype="png", filename=attach_name)
-
-        # Gmail SMTP over SSL (465)
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(sender, app_pw)
-            server.send_message(msg)
-
-        return True, None
+        r = httpx.post("https://api.sendgrid.com/v3/mail/send", headers=headers, json=data, timeout=30.0)
+        if r.status_code == 202:
+            return True, None
+        return False, f"SendGrid error {r.status_code}: {r.text}"
     except Exception as e:
-        logger.exception("SMTP send failed")
+        logger.exception("SendGrid send failed")
         return False, str(e)
 
 async def send_email_async(subject: str, body: str, to_addr: Optional[str] = None,
                            attach_name: Optional[str] = None, attach_bytes: Optional[bytes] = None):
+    """
+    Async wrapper to send via SendGrid. Keeps the same signature used elsewhere.
+    """
     def _send():
-        return _send_email_smtp(
+        return _send_email_sendgrid(
             subject=subject,
             body=body,
             to_addr=to_addr or EMAIL_DEFAULT_TO,
@@ -287,76 +305,9 @@ async def send_email_async(subject: str, body: str, to_addr: Optional[str] = Non
         )
     return await asyncio.to_thread(_send)
 
-# ---- Transcript rendering ----
+# ---- Transcript rendering (kept for future image use; now we send text emails) ----
 def render_transcript_image(chat_title: str, entries: deque) -> Optional[bytes]:
-    if not entries or not PIL_OK:
-        return None
-
-    width = 1000
-    margin = 40
-    line_spacing = 8
-    title_size = 36
-    text_size = 24
-    bg = (255, 255, 255)
-    title_color = (20, 20, 20)
-    meta_color = (90, 90, 90)
-    text_color = (0, 0, 0)
-
-    try:
-        font_title = ImageFont.truetype("arial.ttf", title_size)
-        font_meta = ImageFont.truetype("arial.ttf", text_size)
-        font_text = ImageFont.truetype("arial.ttf", text_size)
-    except Exception:
-        font_title = ImageFont.load_default()
-        font_meta = ImageFont.load_default()
-        font_text = ImageFont.load_default()
-
-    lines = [("title", f"Chat: {chat_title or '(untitled)'}")]
-    for e in entries:
-        lines.append(("meta", f"[{e['ts']}] {e['name']}:"))
-        for w in (textwrap.wrap(e["text"], width=70) or [""]):
-            lines.append(("text", w))
-        lines.append(("spacer", ""))
-
-    def text_h(draw, content, font):
-        bbox = draw.textbbox((0, 0), content, font=font)
-        return bbox[3] - bbox[1]
-
-    img_tmp = Image.new("RGB", (width, 10), bg)
-    dtmp = ImageDraw.Draw(img_tmp)
-    y = margin
-    for t, content in lines:
-        if t == "title":
-            h = text_h(dtmp, content, font_title)
-        elif t == "meta":
-            h = text_h(dtmp, content, font_meta)
-        elif t == "text":
-            h = text_h(dtmp, content, font_text)
-        else:
-            h = max(4, text_size // 2)
-        y += h + line_spacing
-    height = y + margin
-
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-    y = margin
-    for t, content in lines:
-        if t == "title":
-            draw.text((margin, y), content, font=font_title, fill=title_color)
-            h = text_h(draw, content, font_title)
-        elif t == "meta":
-            draw.text((margin, y), content, font=font_meta, fill=meta_color)
-            h = text_h(draw, content, font_meta)
-        elif t == "text":
-            draw.text((margin, y), content, font=font_text, fill=text_color)
-            h = text_h(draw, content, font_text)
-        else:
-            h = max(4, text_size // 2)
-        y += h + line_spacing
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+    return None  # explicitly disabled; we now email plain text
 
 # ---------------- Debounce helpers ----------------
 def _period_key(chat_id: str, period: str) -> Tuple[str, str]:
@@ -388,7 +339,6 @@ def cancel_all_pending_for_chat(chat_id: str):
         task = PENDING_TASK.pop(key, None)
         if task and not task.done():
             task.cancel()
-        # bump token so any stray task that still wakes up will no-op
         DEBOUNCE_TOKEN[key] = _new_token()
 
 # ---------------- Authorization + cooldown helpers ----------------
@@ -461,7 +411,6 @@ async def _buffer_then_send(chat_id: str, period: str, token: str, context: Cont
             open_, _ = is_office_open()
             if open_:
                 return
-            # Only for group chats
             if chat_id not in known_group_chats:
                 return
             if CLOSED_SENT_TODAY_AM.get(chat_id) == now_local.strftime("%Y-%m-%d"):
@@ -567,8 +516,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ssi – Email transcript to info@\n"
         "/sse – Email transcript to endorsements@\n"
         "/ssc – Email transcript to coi@\n"
+        "/who – List known groups (title + ID)\n"
         "/broadcast – Send one-time announcement to all groups\n"
-        "/broadcastpin – Broadcast and try to pin in all groups"
+        "/broadcastpin – Broadcast and try to pin in all groups\n"
+        "/broadcastto – Targeted broadcast to specific group(s) by ID or name"
     )
 
 @require_and_record
@@ -589,9 +540,7 @@ async def generic_command_handler(update: Update, context: ContextTypes.DEFAULT_
     cmd = (update.message.text or "").split()[0].lstrip("/").lower()
     if cmd in COMMAND_MESSAGES:
         await update.message.reply_text(COMMAND_MESSAGES[cmd], parse_mode="Markdown")
-    # Authorized activity timestamp (used for after-hours suppression)
     set_last_auth_msg(chat_id)
-    # NEW: cancel any pending buffered prompts when an authorized user speaks
     cancel_all_pending_for_chat(chat_id)
 
 @require_and_record
@@ -608,22 +557,68 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def coi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(COI_TEXT, parse_mode="Markdown")
 
+# ---------- Broadcast helpers ----------
+def _find_targets_by_names_or_ids(targets_raw: str) -> Tuple[List[int], List[str]]:
+    """
+    Parse targets: either comma-separated IDs, or quoted names (partial match).
+    Returns (chat_ids, errors).
+    Examples:
+      ids:    -100123,-100456
+      names:  "Dispatch Room","AIS Pilots"
+      mixed not supported (keep simple).
+    """
+    errors: List[str] = []
+    chat_ids: List[int] = []
+
+    # Look for quoted names
+    names = re.findall(r'"([^"]+)"', targets_raw)
+    if names:
+        lowered = {cid: (meta.get("title") or "").lower() for cid, meta in known_group_chats.items()}
+        for name in names:
+            name_l = name.strip().lower()
+            matched = [int(cid) for cid, ttl in lowered.items() if name_l in ttl]
+            if not matched:
+                errors.append(f'No group matched name "{name}"')
+            else:
+                chat_ids.extend(matched)
+        # Dedup
+        chat_ids = list(dict.fromkeys(chat_ids))
+        return chat_ids, errors
+
+    # Else expect IDs
+    try:
+        for part in targets_raw.split(","):
+            p = part.strip()
+            if not p:
+                continue
+            chat_ids.append(int(p))
+        chat_ids = list(dict.fromkeys(chat_ids))
+    except Exception:
+        errors.append("Could not parse IDs. Use comma-separated integers or quoted names.")
+    return chat_ids, errors
+
+@require_and_record
+async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not known_group_chats:
+        await update.message.reply_text("No known groups yet. Add me to a group and send any message to register it.")
+        return
+    lines = ["📋 *Known Groups:*"]
+    for cid, meta in known_group_chats.items():
+        title = meta.get("title") or "(untitled)"
+        lines.append(f"• {title} — `{cid}`")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
 @require_and_record
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage: /broadcast Your announcement text here
-    Sends to all known group/supergroup chats the bot has seen.
-    """
     msg = (update.message.text or "").split(" ", 1)
     if len(msg) < 2 or not msg[1].strip():
         await update.message.reply_text("Usage:\n/broadcast Your announcement text")
         return
-
     text = msg[1].strip()
     total = 0
     ok = 0
     fail = 0
-    for cid, meta in list(known_group_chats.items()):
+    for cid in list(known_group_chats.keys()):
         try:
             await context.bot.send_message(chat_id=int(cid), text=text)
             ok += 1
@@ -631,25 +626,19 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fail += 1
             logger.error(f"/broadcast failed for chat {cid}: {e}")
         total += 1
-
     await update.message.reply_text(f"📣 Broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
 
 @require_and_record
 async def broadcastpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Usage: /broadcastpin Your announcement text here
-    Same as /broadcast but pins the message (best-effort).
-    """
     msg = (update.message.text or "").split(" ", 1)
     if len(msg) < 2 or not msg[1].strip():
         await update.message.reply_text("Usage:\n/broadcastpin Your announcement text")
         return
-
     text = msg[1].strip()
     total = 0
     ok = 0
     fail = 0
-    for cid, meta in list(known_group_chats.items()):
+    for cid in list(known_group_chats.keys()):
         try:
             sent = await context.bot.send_message(chat_id=int(cid), text=text)
             try:
@@ -661,9 +650,68 @@ async def broadcastpin_command(update: Update, context: ContextTypes.DEFAULT_TYP
             fail += 1
             logger.error(f"/broadcastpin failed for chat {cid}: {e}")
         total += 1
-
     await update.message.reply_text(f"📌 Broadcast (pinned) done.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
 
+@require_and_record
+async def broadcastto_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage:
+      /broadcastto -100123,-100456 Your message here
+      /broadcastto "Dispatch Room","AIS Pilots" Your message here
+      /broadcastto "dispatch" Quick test 🚀
+    """
+    raw = (update.message.text or "")
+    parts = raw.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(
+            "Usage:\n"
+            "/broadcastto -100123,-100456 Your message here\n"
+            '/broadcastto "Dispatch Room","AIS Pilots" Your message here\n'
+            '/broadcastto "dispatch" Quick test 🚀'
+        )
+        return
+
+    arg = parts[1].strip()
+
+    # If we have quoted names, message starts after the last closing quote
+    quoted_names = re.findall(r'"([^"]+)"', arg)
+    if quoted_names:
+        last_quote = arg.rfind('"')
+        msg_text = arg[last_quote+1:].strip().lstrip(",").strip()
+        targets_str = ",".join([f'"{n}"' for n in quoted_names])
+        targets_ids, errors = _find_targets_by_names_or_ids(targets_str)
+    else:
+        # Split first space: targets then message
+        subparts = arg.split(" ", 1)
+        if len(subparts) < 2:
+            await update.message.reply_text("Please provide targets and a message.\nExample: /broadcastto -100123,-100456 Hello")
+            return
+        targets_str, msg_text = subparts[0].strip(), subparts[1].strip()
+        targets_ids, errors = _find_targets_by_names_or_ids(targets_str)
+
+    if errors:
+        await update.message.reply_text("⚠️ " + " | ".join(errors))
+        return
+    if not targets_ids:
+        await update.message.reply_text("No valid targets found.")
+        return
+    if not msg_text:
+        await update.message.reply_text("Please provide a message to send.")
+        return
+
+    ok = 0
+    fail = 0
+    for cid in targets_ids:
+        try:
+            await context.bot.send_message(chat_id=int(cid), text=msg_text)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/broadcastto failed for chat {cid}: {e}")
+
+    await update.message.reply_text(f"🎯 Targeted broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 🎯 {len(targets_ids)} groups targeted.")
+
+# ---- Transcript emailers (plain text; subject = group title only) ----
 async def _send_transcript_email(update: Update, to_addr: str):
     chat = update.effective_chat
     chat_id = str(chat.id)
@@ -674,23 +722,19 @@ async def _send_transcript_email(update: Update, to_addr: str):
     await update.message.reply_text("⏳ Preparing transcript…")
 
     chat_title = known_group_chats.get(chat_id, {}).get("title") or (chat.title or "")
-    png_bytes = render_transcript_image(chat_title, entries)
-    ts = now_in_timezone().strftime("%Y%m%d-%H%M%S")
-    if png_bytes:
-        ok, err = await send_email_async(
-            subject=f"[Telegram] Transcript – {chat_title} ({chat_id})",
-            body=f"Attached is the transcript image of the last {len(entries)} message(s).",
-            to_addr=to_addr,
-            attach_name=f"telegram_transcript_{chat_id}_{ts}.png",
-            attach_bytes=png_bytes,
-        )
-    else:
-        body = "\n".join([f"[{e['ts']}] {e['name']}: {e['text']}" for e in entries])
-        ok, err = await send_email_async(
-            subject=f"[Telegram] Transcript (text) – {chat_title} ({chat_id})",
-            body=body,
-            to_addr=to_addr,
-        )
+    subject = chat_title  # subject = group name only
+    body_lines = []
+    for e in entries:
+        body_lines.append(f"[{e['ts']}] {e['name']}: {e['text']}")
+    body = "\n".join(body_lines)
+
+    ok, err = await send_email_async(
+        subject=subject,
+        body=body,
+        to_addr=to_addr,
+        attach_name=None,
+        attach_bytes=None,
+    )
     if ok:
         await update.message.reply_text(f"✅ Transcript sent to {to_addr}")
     else:
@@ -737,7 +781,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Authorized messages: never auto-spiel; cancel any pending buffers; record timestamp
     if is_auth:
         set_last_auth_msg(chat_id)
-        cancel_all_pending_for_chat(chat_id)  # cancel 5-min buffers immediately
+        cancel_all_pending_for_chat(chat_id)
         return
 
     # From here, sender is non-authorized.
@@ -826,14 +870,9 @@ async def main():
     if not BOT_TOKEN:
         print("❌ BOT_TOKEN not set"); return
 
-    # SMTP vars check
-    missing = []
-    if not GMAIL_SENDER:
-        missing.append("GMAIL_SENDER")
-    if not GMAIL_APP_PASSWORD:
-        missing.append("GMAIL_APP_PASSWORD")
-    if missing:
-        logger.warning(f"Missing email SMTP env: {missing}")
+    # Email API check
+    if not SENDGRID_API_KEY:
+        logger.warning("SENDGRID_API_KEY missing — transcript emails will fail until set.")
 
     # Optional conflict guard (same-host only)
     guard_sock = _acquire_conflict_guard(CONFLICT_GUARD_PORT)
@@ -856,8 +895,10 @@ async def main():
     app.add_handler(CommandHandler("ssi", ssi_command))
     app.add_handler(CommandHandler("sse", sse_command))
     app.add_handler(CommandHandler("ssc", ssc_command))
+    app.add_handler(CommandHandler("who", who_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
+    app.add_handler(CommandHandler("broadcastto", broadcastto_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
@@ -874,7 +915,8 @@ async def main():
         "ALL auto prompts use 5-min flood buffer (cancelled if an authorized user speaks; AM cancels at opening); "
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
         "AM/PM spiels once per day per *group chat* with strong debouncing; "
-        "broadcast commands available to reach all known groups."
+        "SendGrid email (plain-text transcripts, subject=group title); "
+        "/who, /broadcast, /broadcastpin, and /broadcastto."
     )
     await app.run_polling()
 
