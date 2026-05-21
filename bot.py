@@ -10,6 +10,13 @@ import io
 import textwrap
 import socket
 import base64
+import json
+from pathlib import Path
+
+try:
+    import asyncpg
+except Exception:
+    asyncpg = None
 
 import httpx  # SendGrid HTTPS API
 
@@ -53,6 +60,11 @@ LUNCH_END = time(13, 30)
 
 # Env vars (NO SECRETS HARDCODED)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Persistent group storage
+DATABASE_URL = os.getenv("DATABASE_URL")
+GROUP_CHATS_FILE = os.getenv("GROUP_CHATS_FILE", "group_chats.json")
+db_pool = None
 
 # Email config (SendGrid)
 SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")  # <<< set this in Railway
@@ -182,6 +194,178 @@ chat_last_response: Dict[str, Dict[str, str]] = {}
 TRANSCRIPT_MAX_MESSAGES = 5
 chat_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=TRANSCRIPT_MAX_MESSAGES))
 known_group_chats: Dict[str, Dict[str, Any]] = {}
+
+
+def _normalize_group_record(chat_id: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    meta = meta or {}
+    now_iso = now_in_timezone().isoformat()
+    return {
+        "title": meta.get("title") or meta.get("group_name") or "",
+        "added_on": meta.get("added_on") or meta.get("added_at") or now_iso,
+        "last_seen": meta.get("last_seen") or now_iso,
+    }
+
+
+def merge_known_group(chat_id: str, title: str = "", added_on: Optional[str] = None, last_seen: Optional[str] = None) -> bool:
+    """
+    Add/update one group in memory. Returns True if anything changed.
+    Uses chat_id as the dictionary key, so duplicates are impossible.
+    """
+    cid = str(chat_id).strip()
+    if not cid:
+        return False
+
+    existing = known_group_chats.get(cid)
+    now_iso = now_in_timezone().isoformat()
+
+    if not existing:
+        known_group_chats[cid] = {
+            "title": title or "",
+            "added_on": added_on or now_iso,
+            "last_seen": last_seen or now_iso,
+        }
+        return True
+
+    changed = False
+    if title and existing.get("title") != title:
+        existing["title"] = title
+        changed = True
+    if last_seen and existing.get("last_seen") != last_seen:
+        existing["last_seen"] = last_seen
+        changed = True
+    elif not existing.get("last_seen"):
+        existing["last_seen"] = now_iso
+        changed = True
+    if added_on and not existing.get("added_on"):
+        existing["added_on"] = added_on
+        changed = True
+    return changed
+
+
+def load_known_groups_from_json() -> int:
+    """Load group chats from local JSON backup. Supports dict or list format."""
+    path = Path(GROUP_CHATS_FILE)
+    if not path.exists():
+        logger.info(f"No {GROUP_CHATS_FILE} found yet; starting with empty JSON backup.")
+        return 0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+        loaded = 0
+        if isinstance(raw, dict):
+            for cid, meta in raw.items():
+                if isinstance(meta, dict):
+                    changed = merge_known_group(str(cid), meta.get("title") or meta.get("group_name") or "", meta.get("added_on") or meta.get("added_at"), meta.get("last_seen"))
+                else:
+                    changed = merge_known_group(str(cid))
+                if changed:
+                    loaded += 1
+        elif isinstance(raw, list):
+            for item in raw:
+                if isinstance(item, dict):
+                    cid = item.get("chat_id") or item.get("id")
+                    if cid:
+                        changed = merge_known_group(str(cid), item.get("title") or item.get("group_name") or "", item.get("added_on") or item.get("added_at"), item.get("last_seen"))
+                        if changed:
+                            loaded += 1
+                else:
+                    changed = merge_known_group(str(item))
+                    if changed:
+                        loaded += 1
+        logger.info(f"Loaded {len(known_group_chats)} unique groups from JSON backup/merge.")
+        return loaded
+    except Exception as e:
+        logger.exception(f"Failed to load {GROUP_CHATS_FILE}: {e}")
+        return 0
+
+
+def save_known_groups_to_json() -> None:
+    """Save unique in-memory groups to local JSON backup using atomic write."""
+    try:
+        path = Path(GROUP_CHATS_FILE)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        data = dict(sorted(known_group_chats.items(), key=lambda kv: kv[0]))
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        logger.info(f"JSON backup saved: {len(data)} unique groups in {GROUP_CHATS_FILE}")
+    except Exception as e:
+        logger.exception(f"Failed to save {GROUP_CHATS_FILE}: {e}")
+
+
+async def init_db():
+    """Initialize PostgreSQL if DATABASE_URL is available. JSON still works if DB is unavailable."""
+    global db_pool
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL missing — PostgreSQL persistence disabled; JSON backup only.")
+        return
+    if asyncpg is None:
+        logger.warning("asyncpg is not installed — PostgreSQL persistence disabled; add asyncpg to requirements.txt.")
+        return
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS known_group_chats (
+                    chat_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    added_on TEXT,
+                    last_seen TEXT
+                )
+            """)
+        logger.info("PostgreSQL persistence initialized.")
+    except Exception as e:
+        db_pool = None
+        logger.exception(f"PostgreSQL init failed; continuing with JSON backup only: {e}")
+
+
+async def load_known_groups_from_db() -> int:
+    if not db_pool:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT chat_id, title, added_on, last_seen FROM known_group_chats")
+        changed_count = 0
+        for row in rows:
+            if merge_known_group(row["chat_id"], row["title"] or "", row["added_on"], row["last_seen"]):
+                changed_count += 1
+        logger.info(f"Loaded/merged {len(rows)} groups from PostgreSQL. Total unique groups: {len(known_group_chats)}")
+        return changed_count
+    except Exception as e:
+        logger.exception(f"Failed to load groups from PostgreSQL: {e}")
+        return 0
+
+
+async def save_group_to_db(chat_id: str, title: str = "") -> None:
+    if not db_pool:
+        return
+    now_iso = now_in_timezone().isoformat()
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO known_group_chats (chat_id, title, added_on, last_seen)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (chat_id)
+                DO UPDATE SET
+                    title = CASE WHEN EXCLUDED.title <> '' THEN EXCLUDED.title ELSE known_group_chats.title END,
+                    last_seen = EXCLUDED.last_seen
+            """, str(chat_id), title or "", now_iso, now_iso)
+    except Exception as e:
+        logger.exception(f"Failed to save group {chat_id} to PostgreSQL: {e}")
+
+
+async def persist_known_group(chat_id: str, title: str = "") -> None:
+    """Save to both JSON and PostgreSQL. Broadcasts stay duplicate-safe because memory is keyed by chat_id."""
+    merge_known_group(str(chat_id), title=title or "", last_seen=now_in_timezone().isoformat())
+    save_known_groups_to_json()
+    await save_group_to_db(str(chat_id), title or "")
+
+
+async def sync_all_known_groups_to_db() -> None:
+    """After loading JSON + DB, push merged groups into DB so recovered/preloaded IDs become permanent."""
+    if not db_pool:
+        return
+    for cid, meta in list(known_group_chats.items()):
+        await save_group_to_db(cid, meta.get("title") or "")
+    logger.info(f"Synced {len(known_group_chats)} unique groups into PostgreSQL.")
 
 # Authorized users (seen in AIS team chats) + preloaded env IDs
 team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
@@ -761,9 +945,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Track groups + transcript + (maybe) authorize AIS members
     if chat.type in (Chat.GROUP, Chat.SUPERGROUP):
-        if chat_id not in known_group_chats:
-            known_group_chats[chat_id] = {"title": chat.title or "", "added_on": now.isoformat()}
-            logger.info(f"Saved new group: {chat_id}")
+        existing = known_group_chats.get(chat_id)
+        title = chat.title or ""
+        if not existing:
+            await persist_known_group(chat_id, title)
+            logger.info(f"Saved new group permanently: {chat_id}")
+        elif title and existing.get("title") != title:
+            await persist_known_group(chat_id, title)
+            logger.info(f"Updated group title permanently: {chat_id}")
     maybe_record_team_member(update)
     record_message_for_transcript(update)
 
@@ -879,6 +1068,15 @@ async def main():
     if guard_sock is None:
         logger.error("Exiting due to conflict guard.")
         return
+
+    # Load persistent groups before the bot starts receiving updates.
+    # Order: JSON backup first, then PostgreSQL, then save the merged unique list back to both.
+    load_known_groups_from_json()
+    await init_db()
+    await load_known_groups_from_db()
+    save_known_groups_to_json()
+    await sync_all_known_groups_to_db()
+    logger.info(f"✅ Persistent group registry ready: {len(known_group_chats)} unique groups loaded.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
