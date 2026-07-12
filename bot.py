@@ -606,99 +606,6 @@ async def _send_asp_intro(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
 
-@require_and_record
-async def aspe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _send_asp_intro(update, context, "EN", ASP_ENGLISH_IMAGE, ASP_ENGLISH_TEXT)
-
-
-@require_and_record
-async def aspr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _send_asp_intro(update, context, "RU", ASP_RUSSIAN_IMAGE, ASP_RUSSIAN_TEXT)
-
-
-@require_and_record
-async def aspcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    en = len(get_asp_targets("EN"))
-    ru = len(get_asp_targets("RU"))
-    total = len(get_asp_targets())
-    await update.message.reply_text(
-        f"📊 ASP Groups\n"
-        f"🇺🇸 English: {en}\n"
-        f"🇷🇺 Russian: {ru}\n"
-        f"📦 Total unique ASP groups: {total}"
-    )
-
-
-@require_and_record
-async def aspwho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not asp_group_chats:
-        await update.message.reply_text("No ASP groups saved yet.")
-        return
-
-    lines = ["📋 ASP Groups:"]
-    for cid, meta in asp_group_chats.items():
-        title = meta.get("title") or "(untitled)"
-        langs = "/".join(sorted((meta.get("languages") or {}).keys()))
-        lines.append(f"• [{langs}] {title} — {cid}")
-
-    chunk = lines[0]
-    for line in lines[1:]:
-        candidate = chunk + "\n" + line
-        if len(candidate) > 3500:
-            await update.message.reply_text(chunk)
-            chunk = lines[0] + "\n" + line
-        else:
-            chunk = candidate
-    if chunk:
-        await update.message.reply_text(chunk)
-
-
-async def _asp_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                              language: Optional[str], command_name: str) -> None:
-    parts = (update.message.text or "").split(" ", 1)
-    if len(parts) < 2 or not parts[1].strip():
-        await update.message.reply_text(f"Usage:\n/{command_name} Your announcement text")
-        return
-
-    text_to_send = parts[1].strip()
-    targets = get_asp_targets(language)
-    if not targets:
-        label = language or "ALL"
-        await update.message.reply_text(f"No ASP {label} groups saved yet.")
-        return
-
-    ok = 0
-    fail = 0
-    for cid in targets:
-        try:
-            await context.bot.send_message(chat_id=cid, text=text_to_send)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            logger.error(f"/{command_name} failed for chat {cid}: {e}")
-
-    label = language or "ALL"
-    await update.message.reply_text(
-        f"📣 ASP {label} broadcast complete.\n"
-        f"✅ {ok} succeeded • ❌ {fail} failed • 📦 {len(targets)} unique groups targeted."
-    )
-
-
-@require_and_record
-async def aspbroadcaste_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _asp_broadcast_text(update, context, "EN", "aspbroadcaste")
-
-
-@require_and_record
-async def aspbroadcastr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _asp_broadcast_text(update, context, "RU", "aspbroadcastr")
-
-
-@require_and_record
-async def aspbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _asp_broadcast_text(update, context, None, "aspbroadcast")
-
-
 # Authorized users (seen in AIS team chats) + preloaded env IDs
 team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
 
@@ -1013,6 +920,100 @@ def require_and_record(func):
         record_message_for_transcript(update)
         return await func(update, context)
     return inner
+
+@require_and_record
+async def aspe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_asp_intro(update, context, "EN", ASP_ENGLISH_IMAGE, ASP_ENGLISH_TEXT)
+
+
+@require_and_record
+async def aspr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_asp_intro(update, context, "RU", ASP_RUSSIAN_IMAGE, ASP_RUSSIAN_TEXT)
+
+
+@require_and_record
+async def aspcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    en = len(get_asp_targets("EN"))
+    ru = len(get_asp_targets("RU"))
+    total = len(get_asp_targets())
+    await update.message.reply_text(
+        f"📊 ASP Groups\n"
+        f"🇺🇸 English: {en}\n"
+        f"🇷🇺 Russian: {ru}\n"
+        f"📦 Total unique ASP groups: {total}"
+    )
+
+
+@require_and_record
+async def aspwho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not asp_group_chats:
+        await update.message.reply_text("No ASP groups saved yet.")
+        return
+
+    lines = ["📋 ASP Groups:"]
+    for cid, meta in asp_group_chats.items():
+        title = meta.get("title") or "(untitled)"
+        langs = "/".join(sorted((meta.get("languages") or {}).keys()))
+        lines.append(f"• [{langs}] {title} — {cid}")
+
+    chunk = lines[0]
+    for line in lines[1:]:
+        candidate = chunk + "\n" + line
+        if len(candidate) > 3500:
+            await update.message.reply_text(chunk)
+            chunk = lines[0] + "\n" + line
+        else:
+            chunk = candidate
+    if chunk:
+        await update.message.reply_text(chunk)
+
+
+async def _asp_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              language: Optional[str], command_name: str) -> None:
+    parts = (update.message.text or "").split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(f"Usage:\n/{command_name} Your announcement text")
+        return
+
+    text_to_send = parts[1].strip()
+    targets = get_asp_targets(language)
+    if not targets:
+        label = language or "ALL"
+        await update.message.reply_text(f"No ASP {label} groups saved yet.")
+        return
+
+    ok = 0
+    fail = 0
+    for cid in targets:
+        try:
+            await context.bot.send_message(chat_id=cid, text=text_to_send)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/{command_name} failed for chat {cid}: {e}")
+
+    label = language or "ALL"
+    await update.message.reply_text(
+        f"📣 ASP {label} broadcast complete.\n"
+        f"✅ {ok} succeeded • ❌ {fail} failed • 📦 {len(targets)} unique groups targeted."
+    )
+
+
+@require_and_record
+async def aspbroadcaste_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, "EN", "aspbroadcaste")
+
+
+@require_and_record
+async def aspbroadcastr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, "RU", "aspbroadcastr")
+
+
+@require_and_record
+async def aspbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, None, "aspbroadcast")
+
+
 
 @require_and_record
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
