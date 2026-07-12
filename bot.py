@@ -596,9 +596,14 @@ async def _send_asp_intro(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
         # Save only after Telegram confirms the ASP post was sent successfully.
         await persist_asp_group(str(chat.id), language, chat.title or "")
-        await update.message.reply_text(
-            f"✅ ASP {language} introduction sent and this group was saved permanently to the ASP {language} list."
-        )
+
+        # Keep the insured group clean: remove the staff command and send no public confirmation.
+        try:
+            await update.message.delete()
+        except Exception as delete_error:
+            logger.warning(
+                f"ASP post sent and saved, but command message could not be deleted in chat {chat.id}: {delete_error}"
+            )
     except Exception as e:
         logger.exception(f"Failed to send ASP {language} introduction to {chat.id}: {e}")
         await update.message.reply_text(
