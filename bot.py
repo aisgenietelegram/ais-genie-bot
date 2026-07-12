@@ -64,6 +64,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Persistent group storage
 DATABASE_URL = os.getenv("DATABASE_URL")
 GROUP_CHATS_FILE = os.getenv("GROUP_CHATS_FILE", "group_chats.json")
+ASP_GROUP_CHATS_FILE = os.getenv("ASP_GROUP_CHATS_FILE", "asp_group_chats.json")
+BASE_DIR = Path(__file__).resolve().parent
+ASP_ENGLISH_IMAGE = BASE_DIR / "asp_english.png"
+ASP_RUSSIAN_IMAGE = BASE_DIR / "asp_russian.png"
 db_pool = None
 
 # Email config (SendGrid)
@@ -163,6 +167,27 @@ EMAILS_MESSAGE = (
     "• claims@myaisagency.com – Claims"
 )
 
+
+ASP_ENGLISH_TEXT = (
+    "WE'RE EXCITED TO INTRODUCE ADVANCED SAFETY PARTNERS!\n\n"
+    "We're proud to be the sister company of Advanced Insurance Solutions, working together to provide trucking companies "
+    "with everything they need—from insurance and authority setup to safety, compliance, and ongoing FMCSA support. "
+    "Our goal is to make running your trucking business simpler by offering everything under one trusted team.\n\n"
+    "Call: +1 847-999-3853\n"
+    "Email: info@myaspconsultants.com\n"
+    "Telegram - @KrissOsadchuk"
+)
+
+ASP_RUSSIAN_TEXT = (
+    "Мы гордимся тем, что являемся дочерней (сестринской) компанией Advanced Insurance Solutions. "
+    "Работая вместе, мы предоставляем транспортным компаниям всё необходимое — от страхования и оформления разрешений "
+    "(Authority Setup) до услуг по безопасности, соблюдению нормативных требований и постоянной поддержки по вопросам FMCSA.\n\n"
+    "Наша цель — сделать управление вашим транспортным бизнесом проще, предлагая полный комплекс услуг в рамках одной надёжной команды.\n\n"
+    "Call: +1 847-999-3853\n"
+    "Email: info@myaspconsultants.com\n"
+    "Telegram - @KrissOsadchuk"
+)
+
 COMMAND_MESSAGES = {
     "lt": "📄 Please send us the Lease Termination to proceed with removal. This is required.",
     "apd": (
@@ -194,6 +219,7 @@ chat_last_response: Dict[str, Dict[str, str]] = {}
 TRANSCRIPT_MAX_MESSAGES = 5
 chat_buffers: Dict[str, deque] = defaultdict(lambda: deque(maxlen=TRANSCRIPT_MAX_MESSAGES))
 known_group_chats: Dict[str, Dict[str, Any]] = {}
+asp_group_chats: Dict[str, Dict[str, Any]] = {}
 
 
 def _normalize_group_record(chat_id: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -366,6 +392,312 @@ async def sync_all_known_groups_to_db() -> None:
     for cid, meta in list(known_group_chats.items()):
         await save_group_to_db(cid, meta.get("title") or "")
     logger.info(f"Synced {len(known_group_chats)} unique groups into PostgreSQL.")
+
+
+def merge_asp_group(chat_id: str, language: str, title: str = "",
+                    first_sent_at: Optional[str] = None, last_sent_at: Optional[str] = None) -> bool:
+    """Merge one ASP group/language into memory. Duplicate-safe by chat_id + language."""
+    cid = str(chat_id).strip()
+    lang = language.upper().strip()
+    if not cid or lang not in {"EN", "RU"}:
+        return False
+
+    now_iso = now_in_timezone().isoformat()
+    record = asp_group_chats.setdefault(cid, {"title": title or "", "languages": {}})
+    changed = False
+
+    if title and record.get("title") != title:
+        record["title"] = title
+        changed = True
+
+    languages = record.setdefault("languages", {})
+    if lang not in languages:
+        languages[lang] = {
+            "first_sent_at": first_sent_at or now_iso,
+            "last_sent_at": last_sent_at or now_iso,
+        }
+        return True
+
+    lang_meta = languages[lang]
+    if first_sent_at and not lang_meta.get("first_sent_at"):
+        lang_meta["first_sent_at"] = first_sent_at
+        changed = True
+    if last_sent_at and lang_meta.get("last_sent_at") != last_sent_at:
+        lang_meta["last_sent_at"] = last_sent_at
+        changed = True
+    return changed
+
+
+def load_asp_groups_from_json() -> int:
+    path = Path(ASP_GROUP_CHATS_FILE)
+    if not path.exists():
+        logger.info(f"No {ASP_GROUP_CHATS_FILE} found yet; starting with empty ASP JSON backup.")
+        return 0
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8") or "{}")
+        loaded = 0
+        if isinstance(raw, dict):
+            for cid, meta in raw.items():
+                if not isinstance(meta, dict):
+                    continue
+                title = meta.get("title") or ""
+                languages = meta.get("languages") or {}
+                if isinstance(languages, dict):
+                    for lang, lang_meta in languages.items():
+                        lang_meta = lang_meta if isinstance(lang_meta, dict) else {}
+                        if merge_asp_group(
+                            str(cid), str(lang), title,
+                            lang_meta.get("first_sent_at"),
+                            lang_meta.get("last_sent_at"),
+                        ):
+                            loaded += 1
+        logger.info(
+            f"Loaded ASP JSON backup: {len(asp_group_chats)} unique groups, "
+            f"{sum(len(v.get('languages', {})) for v in asp_group_chats.values())} language registrations."
+        )
+        return loaded
+    except Exception as e:
+        logger.exception(f"Failed to load {ASP_GROUP_CHATS_FILE}: {e}")
+        return 0
+
+
+def save_asp_groups_to_json() -> None:
+    try:
+        path = Path(ASP_GROUP_CHATS_FILE)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        data = dict(sorted(asp_group_chats.items(), key=lambda kv: kv[0]))
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+        logger.info(f"ASP JSON backup saved: {len(data)} unique ASP groups.")
+    except Exception as e:
+        logger.exception(f"Failed to save {ASP_GROUP_CHATS_FILE}: {e}")
+
+
+async def init_asp_db() -> None:
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS asp_group_chats (
+                    chat_id TEXT NOT NULL,
+                    language TEXT NOT NULL,
+                    title TEXT,
+                    first_sent_at TEXT,
+                    last_sent_at TEXT,
+                    PRIMARY KEY (chat_id, language)
+                )
+            """)
+        logger.info("ASP PostgreSQL persistence initialized.")
+    except Exception as e:
+        logger.exception(f"ASP PostgreSQL init failed: {e}")
+
+
+async def load_asp_groups_from_db() -> int:
+    if not db_pool:
+        return 0
+    try:
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT chat_id, language, title, first_sent_at, last_sent_at FROM asp_group_chats"
+            )
+        changed_count = 0
+        for row in rows:
+            if merge_asp_group(
+                row["chat_id"], row["language"], row["title"] or "",
+                row["first_sent_at"], row["last_sent_at"],
+            ):
+                changed_count += 1
+        logger.info(
+            f"Loaded/merged {len(rows)} ASP registrations from PostgreSQL. "
+            f"Total unique ASP groups: {len(asp_group_chats)}"
+        )
+        return changed_count
+    except Exception as e:
+        logger.exception(f"Failed to load ASP groups from PostgreSQL: {e}")
+        return 0
+
+
+async def save_asp_group_to_db(chat_id: str, language: str, title: str = "",
+                               first_sent_at: Optional[str] = None,
+                               last_sent_at: Optional[str] = None) -> None:
+    if not db_pool:
+        return
+    now_iso = now_in_timezone().isoformat()
+    first_sent_at = first_sent_at or now_iso
+    last_sent_at = last_sent_at or now_iso
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO asp_group_chats
+                    (chat_id, language, title, first_sent_at, last_sent_at)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (chat_id, language)
+                DO UPDATE SET
+                    title = CASE WHEN EXCLUDED.title <> '' THEN EXCLUDED.title ELSE asp_group_chats.title END,
+                    last_sent_at = EXCLUDED.last_sent_at
+            """, str(chat_id), language.upper(), title or "", first_sent_at, last_sent_at)
+    except Exception as e:
+        logger.exception(f"Failed to save ASP group {chat_id}/{language} to PostgreSQL: {e}")
+
+
+async def persist_asp_group(chat_id: str, language: str, title: str = "") -> None:
+    now_iso = now_in_timezone().isoformat()
+    merge_asp_group(str(chat_id), language, title=title or "", last_sent_at=now_iso)
+    save_asp_groups_to_json()
+
+    record = asp_group_chats[str(chat_id)]
+    lang_meta = record["languages"][language.upper()]
+    await save_asp_group_to_db(
+        str(chat_id), language.upper(), record.get("title") or "",
+        lang_meta.get("first_sent_at"), lang_meta.get("last_sent_at"),
+    )
+
+
+async def sync_all_asp_groups_to_db() -> None:
+    if not db_pool:
+        return
+    count = 0
+    for cid, meta in list(asp_group_chats.items()):
+        for lang, lang_meta in (meta.get("languages") or {}).items():
+            await save_asp_group_to_db(
+                cid, lang, meta.get("title") or "",
+                lang_meta.get("first_sent_at"), lang_meta.get("last_sent_at"),
+            )
+            count += 1
+    logger.info(f"Synced {count} ASP language registrations into PostgreSQL.")
+
+
+def get_asp_targets(language: Optional[str] = None) -> List[int]:
+    lang = language.upper() if language else None
+    targets: List[int] = []
+    for cid, meta in asp_group_chats.items():
+        languages = meta.get("languages") or {}
+        if lang is None or lang in languages:
+            targets.append(int(cid))
+    return list(dict.fromkeys(targets))
+
+
+async def _send_asp_intro(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          language: str, image_path: Path, caption: str) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
+        await update.message.reply_text("Please use this command inside the insured group chat.")
+        return
+
+    if not image_path.exists():
+        await update.message.reply_text(f"❌ ASP image file is missing: {image_path.name}")
+        logger.error(f"Missing ASP image file: {image_path}")
+        return
+
+    try:
+        with image_path.open("rb") as photo:
+            await context.bot.send_photo(chat_id=chat.id, photo=photo, caption=caption)
+
+        # Save only after Telegram confirms the ASP post was sent successfully.
+        await persist_asp_group(str(chat.id), language, chat.title or "")
+        await update.message.reply_text(
+            f"✅ ASP {language} introduction sent and this group was saved permanently to the ASP {language} list."
+        )
+    except Exception as e:
+        logger.exception(f"Failed to send ASP {language} introduction to {chat.id}: {e}")
+        await update.message.reply_text(
+            f"❌ ASP {language} introduction failed. This group was NOT added to the ASP list."
+        )
+
+
+@require_and_record
+async def aspe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_asp_intro(update, context, "EN", ASP_ENGLISH_IMAGE, ASP_ENGLISH_TEXT)
+
+
+@require_and_record
+async def aspr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_asp_intro(update, context, "RU", ASP_RUSSIAN_IMAGE, ASP_RUSSIAN_TEXT)
+
+
+@require_and_record
+async def aspcount_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    en = len(get_asp_targets("EN"))
+    ru = len(get_asp_targets("RU"))
+    total = len(get_asp_targets())
+    await update.message.reply_text(
+        f"📊 ASP Groups\n"
+        f"🇺🇸 English: {en}\n"
+        f"🇷🇺 Russian: {ru}\n"
+        f"📦 Total unique ASP groups: {total}"
+    )
+
+
+@require_and_record
+async def aspwho_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not asp_group_chats:
+        await update.message.reply_text("No ASP groups saved yet.")
+        return
+
+    lines = ["📋 ASP Groups:"]
+    for cid, meta in asp_group_chats.items():
+        title = meta.get("title") or "(untitled)"
+        langs = "/".join(sorted((meta.get("languages") or {}).keys()))
+        lines.append(f"• [{langs}] {title} — {cid}")
+
+    chunk = lines[0]
+    for line in lines[1:]:
+        candidate = chunk + "\n" + line
+        if len(candidate) > 3500:
+            await update.message.reply_text(chunk)
+            chunk = lines[0] + "\n" + line
+        else:
+            chunk = candidate
+    if chunk:
+        await update.message.reply_text(chunk)
+
+
+async def _asp_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              language: Optional[str], command_name: str) -> None:
+    parts = (update.message.text or "").split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text(f"Usage:\n/{command_name} Your announcement text")
+        return
+
+    text_to_send = parts[1].strip()
+    targets = get_asp_targets(language)
+    if not targets:
+        label = language or "ALL"
+        await update.message.reply_text(f"No ASP {label} groups saved yet.")
+        return
+
+    ok = 0
+    fail = 0
+    for cid in targets:
+        try:
+            await context.bot.send_message(chat_id=cid, text=text_to_send)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/{command_name} failed for chat {cid}: {e}")
+
+    label = language or "ALL"
+    await update.message.reply_text(
+        f"📣 ASP {label} broadcast complete.\n"
+        f"✅ {ok} succeeded • ❌ {fail} failed • 📦 {len(targets)} unique groups targeted."
+    )
+
+
+@require_and_record
+async def aspbroadcaste_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, "EN", "aspbroadcaste")
+
+
+@require_and_record
+async def aspbroadcastr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, "RU", "aspbroadcastr")
+
+
+@require_and_record
+async def aspbroadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _asp_broadcast_text(update, context, None, "aspbroadcast")
+
 
 # Authorized users (seen in AIS team chats) + preloaded env IDs
 team_user_ids: set[int] = set(PREAUTHORIZED_USER_IDS)
@@ -703,7 +1035,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/who – List known groups (title + ID)\n"
         "/broadcast – Send one-time announcement to all groups\n"
         "/broadcastpin – Broadcast and try to pin in all groups\n"
-        "/broadcastto – Targeted broadcast to specific group(s) by ID or name"
+        "/broadcastto – Targeted broadcast to specific group(s) by ID or name\n"
+        "/ASPE – Send English ASP introduction + save group to ASP EN list\n"
+        "/ASPR – Send Russian ASP introduction + save group to ASP RU list\n"
+        "/aspcount – Show ASP English/Russian/unique group counts\n"
+        "/aspwho – List saved ASP groups in safe chunks\n"
+        "/aspbroadcaste – Broadcast text to ASP English groups only\n"
+        "/aspbroadcastr – Broadcast text to ASP Russian groups only\n"
+        "/aspbroadcast – Broadcast text to all unique ASP groups"
     )
 
 @require_and_record
@@ -786,11 +1125,22 @@ async def who_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not known_group_chats:
         await update.message.reply_text("No known groups yet. Add me to a group and send any message to register it.")
         return
-    lines = ["📋 *Known Groups:*"]
+
+    lines = [f"📋 Known Groups: {len(known_group_chats)}"]
     for cid, meta in known_group_chats.items():
         title = meta.get("title") or "(untitled)"
-        lines.append(f"• {title} — `{cid}`")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        lines.append(f"• {title} — {cid}")
+
+    chunk = lines[0]
+    for line in lines[1:]:
+        candidate = chunk + "\n" + line
+        if len(candidate) > 3500:
+            await update.message.reply_text(chunk)
+            chunk = lines[0] + "\n" + line
+        else:
+            chunk = candidate
+    if chunk:
+        await update.message.reply_text(chunk)
 
 @require_and_record
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1072,11 +1422,17 @@ async def main():
     # Load persistent groups before the bot starts receiving updates.
     # Order: JSON backup first, then PostgreSQL, then save the merged unique list back to both.
     load_known_groups_from_json()
+    load_asp_groups_from_json()
     await init_db()
+    await init_asp_db()
     await load_known_groups_from_db()
+    await load_asp_groups_from_db()
     save_known_groups_to_json()
+    save_asp_groups_to_json()
     await sync_all_known_groups_to_db()
+    await sync_all_asp_groups_to_db()
     logger.info(f"✅ Persistent group registry ready: {len(known_group_chats)} unique groups loaded.")
+    logger.info(f"✅ Persistent ASP registry ready: {len(asp_group_chats)} unique ASP groups loaded.")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1097,6 +1453,13 @@ async def main():
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
     app.add_handler(CommandHandler("broadcastto", broadcastto_command))
+    app.add_handler(CommandHandler("aspe", aspe_command))
+    app.add_handler(CommandHandler("aspr", aspr_command))
+    app.add_handler(CommandHandler("aspcount", aspcount_command))
+    app.add_handler(CommandHandler("aspwho", aspwho_command))
+    app.add_handler(CommandHandler("aspbroadcaste", aspbroadcaste_command))
+    app.add_handler(CommandHandler("aspbroadcastr", aspbroadcastr_command))
+    app.add_handler(CommandHandler("aspbroadcast", aspbroadcast_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
@@ -1114,7 +1477,7 @@ async def main():
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
         "AM/PM spiels once per day per *group chat* with strong debouncing; "
         "SendGrid email (plain-text transcripts, subject=group title); "
-        "/who, /broadcast, /broadcastpin, and /broadcastto."
+        "/who, /broadcast, /broadcastpin, /broadcastto, /ASPE, /ASPR, and ASP registry commands."
     )
     await app.run_polling()
 
