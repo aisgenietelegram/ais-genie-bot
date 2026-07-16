@@ -5,12 +5,14 @@ import asyncio
 from datetime import datetime, time, timedelta
 from collections import deque, defaultdict
 from typing import Dict, Any, Optional, Set, Tuple, List
+from difflib import SequenceMatcher
 import pytz
 import io
 import textwrap
 import socket
 import base64
 import json
+import csv
 from pathlib import Path
 
 try:
@@ -68,6 +70,7 @@ ASP_GROUP_CHATS_FILE = os.getenv("ASP_GROUP_CHATS_FILE", "asp_group_chats.json")
 BASE_DIR = Path(__file__).resolve().parent
 ASP_ENGLISH_IMAGE = BASE_DIR / "asp_english.png"
 ASP_RUSSIAN_IMAGE = BASE_DIR / "asp_russian.png"
+INSURED_NAMES_FILE = BASE_DIR / "insured_names.txt"
 db_pool = None
 
 # Email config (SendGrid)
@@ -1048,7 +1051,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/aspwho – List saved ASP groups in safe chunks\n"
         "/aspbroadcaste – Broadcast text to ASP English groups only\n"
         "/aspbroadcastr – Broadcast text to ASP Russian groups only\n"
-        "/aspbroadcast – Broadcast text to all unique ASP groups"
+        "/aspbroadcast – Broadcast text to all unique ASP groups\n"
+        "/refreshtitles – Recover/update names from Telegram\n"
+        "/findgroup – Search company name and show chat IDs\n"
+        "/exportgroups – Download all names and IDs as CSV\n"
+        "/matchinsured – Match insured list and export chat IDs"
     )
 
 @require_and_record
@@ -1250,6 +1257,197 @@ async def broadcastto_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             logger.error(f"/broadcastto failed for chat {cid}: {e}")
 
     await update.message.reply_text(f"🎯 Targeted broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 🎯 {len(targets_ids)} groups targeted.")
+
+
+def _normalize_company_name(value: str) -> str:
+    value = (value or "").lower().replace("&", " and ")
+    value = re.sub(r"\b(insurance|ais|apd|fleet|sitor|general|chat|group)\b", " ", value)
+    value = re.sub(r"\b(incorporated|corporation|company|limited liability company)\b", " ", value)
+    value = re.sub(r"\b(inc|llc|corp|co|ltd)\b", " ", value)
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+
+def _company_match_score(requested: str, title: str) -> float:
+    left = _normalize_company_name(requested)
+    right = _normalize_company_name(title)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    if left in right or right in left:
+        return 0.90 + (0.09 * min(len(left), len(right)) / max(len(left), len(right)))
+    return SequenceMatcher(None, left, right).ratio()
+
+
+@require_and_record
+async def refreshtitles_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    total = len(known_group_chats)
+    if not total:
+        await update.message.reply_text("No saved groups to refresh.")
+        return
+
+    progress = await update.message.reply_text(
+        f"🔄 Refreshing titles for {total} saved groups. This may take several minutes..."
+    )
+    updated = unchanged = unavailable = processed = 0
+
+    for cid in list(known_group_chats.keys()):
+        try:
+            chat = await context.bot.get_chat(int(cid))
+            title = chat.title or ""
+            old_title = known_group_chats.get(cid, {}).get("title") or ""
+            if title and title != old_title:
+                await persist_known_group(cid, title)
+                updated += 1
+            else:
+                unchanged += 1
+        except Exception as e:
+            unavailable += 1
+            logger.warning(f"/refreshtitles could not access {cid}: {e}")
+
+        processed += 1
+        if processed % 25 == 0:
+            try:
+                await progress.edit_text(
+                    f"🔄 Refreshing group titles...\n"
+                    f"Processed: {processed}/{total}\n"
+                    f"✅ Updated: {updated}\n"
+                    f"➖ Unchanged: {unchanged}\n"
+                    f"❌ Unavailable: {unavailable}"
+                )
+            except Exception:
+                pass
+        await asyncio.sleep(0.08)
+
+    save_known_groups_to_json()
+    await progress.edit_text(
+        f"✅ Title refresh complete\n\n"
+        f"📦 Total checked: {total}\n"
+        f"✅ Names updated: {updated}\n"
+        f"➖ Already current: {unchanged}\n"
+        f"❌ Bot could not access: {unavailable}"
+    )
+
+
+@require_and_record
+async def findgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parts = (update.message.text or "").split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage:\n/findgroup Company Name")
+        return
+
+    requested = parts[1].strip()
+    scored = []
+    for cid, meta in known_group_chats.items():
+        title = meta.get("title") or ""
+        score = _company_match_score(requested, title)
+        if score >= 0.45:
+            scored.append((score, title or "(recovered)", cid))
+
+    scored.sort(key=lambda item: (-item[0], item[1].lower()))
+    if not scored:
+        await update.message.reply_text(f'No saved group matched "{requested}".')
+        return
+
+    lines = [f'🔎 Matches for "{requested}":']
+    for score, title, cid in scored[:15]:
+        lines.append(f"• {title}\n  {cid} — {score:.0%} match")
+    await update.message.reply_text("\n".join(lines))
+
+
+@require_and_record
+async def exportgroups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["group_name", "chat_id", "added_on", "last_seen"])
+
+    rows = sorted(
+        [
+            (
+                meta.get("title") or "(recovered)",
+                cid,
+                meta.get("added_on") or "",
+                meta.get("last_seen") or "",
+            )
+            for cid, meta in known_group_chats.items()
+        ],
+        key=lambda row: (row[0].lower(), row[1]),
+    )
+    writer.writerows(rows)
+
+    await update.message.reply_document(
+        document=io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        filename="all_telegram_groups.csv",
+        caption=f"📄 Exported {len(rows)} saved Telegram groups."
+    )
+
+
+@require_and_record
+async def matchinsured_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not INSURED_NAMES_FILE.exists():
+        await update.message.reply_text("❌ insured_names.txt is missing from the bot folder.")
+        return
+
+    requested_names = [
+        line.strip()
+        for line in INSURED_NAMES_FILE.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    group_records = [
+        (cid, meta.get("title") or "")
+        for cid, meta in known_group_chats.items()
+        if meta.get("title")
+    ]
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "requested_company", "status", "best_group_name", "chat_id", "match_score",
+        "second_possible_match", "second_chat_id", "second_score"
+    ])
+
+    matched = review = not_found = 0
+
+    for requested in requested_names:
+        scores = sorted(
+            [
+                (_company_match_score(requested, title), title, cid)
+                for cid, title in group_records
+            ],
+            key=lambda item: (-item[0], item[1].lower()),
+        )
+        best = scores[0] if scores else (0.0, "", "")
+        second = scores[1] if len(scores) > 1 else (0.0, "", "")
+
+        if best[0] >= 0.88:
+            status = "MATCHED"
+            matched += 1
+        elif best[0] >= 0.58:
+            status = "REVIEW POSSIBLE MATCH"
+            review += 1
+        else:
+            status = "NOT FOUND"
+            not_found += 1
+
+        writer.writerow([
+            requested, status, best[1], best[2], f"{best[0]:.0%}",
+            second[1], second[2], f"{second[0]:.0%}"
+        ])
+
+    await update.message.reply_document(
+        document=io.BytesIO(output.getvalue().encode("utf-8-sig")),
+        filename="insured_group_chat_id_matches.csv",
+        caption=(
+            f"📋 Insured matching complete\n"
+            f"✅ Matched: {matched}\n"
+            f"⚠️ Review: {review}\n"
+            f"❌ Not found: {not_found}\n"
+            f"📦 Requested names: {len(requested_names)}"
+        )
+    )
+
 
 # ---- Transcript emailers (plain text; subject = group title only) ----
 async def _send_transcript_email(update: Update, to_addr: str):
@@ -1466,6 +1664,10 @@ async def main():
     app.add_handler(CommandHandler("aspbroadcaste", aspbroadcaste_command))
     app.add_handler(CommandHandler("aspbroadcastr", aspbroadcastr_command))
     app.add_handler(CommandHandler("aspbroadcast", aspbroadcast_command))
+    app.add_handler(CommandHandler("refreshtitles", refreshtitles_command))
+    app.add_handler(CommandHandler("findgroup", findgroup_command))
+    app.add_handler(CommandHandler("exportgroups", exportgroups_command))
+    app.add_handler(CommandHandler("matchinsured", matchinsured_command))
 
     # Messages
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
