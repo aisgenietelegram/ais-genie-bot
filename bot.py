@@ -56,7 +56,7 @@ PREAUTHORIZED_USER_IDS = {int(x) for x in _csv_env("AUTHORIZED_USER_IDS")} if _c
 WEEKDAY_START = time(9, 0)
 WEEKDAY_END = time(17, 0)
 WEEKDAY_CUTOFF = time(16, 30)  # 4:30 PM
-LAST_CALL_TIME = time(16, 0)   # 4:00 PM
+LAST_CALL_TIME = time(15, 0)   # 3:00 PM
 LUNCH_START = time(12, 30)
 LUNCH_END = time(13, 30)
 
@@ -70,6 +70,8 @@ ASP_GROUP_CHATS_FILE = os.getenv("ASP_GROUP_CHATS_FILE", "asp_group_chats.json")
 BASE_DIR = Path(__file__).resolve().parent
 ASP_ENGLISH_IMAGE = BASE_DIR / "asp_english.png"
 ASP_RUSSIAN_IMAGE = BASE_DIR / "asp_russian.png"
+OA_ENGLISH_IMAGE = BASE_DIR / "oa_english.png"
+BROADCAST_EXCLUSIONS_FILE = os.getenv("BROADCAST_EXCLUSIONS_FILE", "broadcast_exclusions.json")
 INSURED_NAMES_FILE = BASE_DIR / "insured_names.txt"
 db_pool = None
 
@@ -142,19 +144,17 @@ RULES_MESSAGE = (
     "• Send CDL with driver’s name clearly visible.\n"
     "• Physical Damage coverage is not automatically added.\n\n"
     "*Timing*\n"
-    "• We accept changes Mon–Fri, 9:00 AM – 4:30 PM (Last Call 4:00 PM).\n"
+    "• We accept changes Mon–Fri, 9:00 AM – 4:30 PM (Last Call around 3:00 PM).\n"
     "• We do not work weekends. Please resend your request Monday.\n\n"
     "✅ *No change is valid unless confirmed by email.*"
 )
 
 LAST_CALL_MESSAGE = (
     "📢 *Last Call – 4:30 PM Cut-off*\n\n"
-    "Please send any remaining requests before **4:30 PM CT**.\n"
-    "After that, they’ll be handled the next business day.\n\n"
-    "📌 Please resend your request after we open so we can handle it promptly.\n"
-    "🔔 *Starting September 1:* This will be strictly enforced. Thank you! 🙏"
-    "📌 Requests sent after hours will be handled on the next business day.\n"
-    "Thank you for your understanding! 🙏"
+    "Please send any remaining requests as early as possible. Our daily cut-off is **4:30 PM CT**.\n\n"
+    "Requests received after 4:30 PM will be handled on the next business day.\n\n"
+    "⚠️ *Effective immediately, the 4:30 PM cut-off will be strictly enforced.*\n\n"
+    "Thank you for your cooperation and understanding. 🙏"
 )
 
 LUNCH_MESSAGE = (
@@ -190,6 +190,27 @@ ASP_RUSSIAN_TEXT = (
     "Email: info@myaspconsultants.com\n"
     "Telegram - @KrissOsadchuk"
 )
+
+OA_ENGLISH_TEXT = (
+    "🚛 NOW OFFERING OCCUPATIONAL ACCIDENT INSURANCE! 🚛\n"
+    "PROTECT YOUR DRIVERS. PROTECT YOUR BUSINESS.\n\n"
+    "Advanced Insurance Solutions is proud to offer Occupational Accident Insurance designed specifically for the trucking industry.\n\n"
+    "Coverage may include:\n"
+    "✔️ Medical Expenses\n"
+    "✔️ Disability Benefits\n"
+    "✔️ Accidental Death & Dismemberment\n"
+    "✔️ Survivor Benefits\n"
+    "✔️ Affordable Coverage for Owner-Operators & Independent Contractors\n\n"
+    "Don't leave your drivers unprotected.\n\n"
+    "Accidents happen. Make sure your team has the coverage they deserve while keeping your business moving forward.\n\n"
+    "GET A FREE QUOTE TODAY FOR AS LOW AS $126 PER DRIVER!!!\n\n"
+    "Advanced Insurance Solutions\n"
+    "Reliable Coverage. Trusted Service. Peace of Mind.\n"
+    "Call: +1 312-578-8500\n"
+    "Email: alex@myaisagency.com\n"
+    "Telegram - @Alex1AIS"
+)
+
 
 COMMAND_MESSAGES = {
     "lt": "📄 Please send us the Lease Termination to proceed with removal. This is required.",
@@ -340,6 +361,14 @@ async def init_db():
                     last_seen TEXT
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS daily_group_activity (
+                    chat_id TEXT NOT NULL,
+                    activity_date TEXT NOT NULL,
+                    last_activity_at TEXT,
+                    PRIMARY KEY (chat_id, activity_date)
+                )
+            """)
         logger.info("PostgreSQL persistence initialized.")
     except Exception as e:
         db_pool = None
@@ -395,6 +424,41 @@ async def sync_all_known_groups_to_db() -> None:
     for cid, meta in list(known_group_chats.items()):
         await save_group_to_db(cid, meta.get("title") or "")
     logger.info(f"Synced {len(known_group_chats)} unique groups into PostgreSQL.")
+
+
+async def mark_daily_activity(chat_id: str) -> None:
+    """Remember that a group was active today, both in memory and PostgreSQL."""
+    cid = str(chat_id)
+    now = now_in_timezone()
+    day = now.strftime("%Y-%m-%d")
+    LAST_CHAT_ACTIVITY[cid] = day
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO daily_group_activity (chat_id, activity_date, last_activity_at)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (chat_id, activity_date)
+                DO UPDATE SET last_activity_at = EXCLUDED.last_activity_at
+            """, cid, day, now.isoformat())
+    except Exception as e:
+        logger.exception(f"Failed to save daily activity for {cid}: {e}")
+
+
+async def get_active_group_ids(activity_date: str) -> Set[str]:
+    targets = {cid for cid, day in LAST_CHAT_ACTIVITY.items() if day == activity_date}
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT chat_id FROM daily_group_activity WHERE activity_date = $1",
+                    activity_date,
+                )
+            targets.update(str(row["chat_id"]) for row in rows)
+        except Exception as e:
+            logger.exception(f"Failed to load active groups for {activity_date}: {e}")
+    return targets
 
 
 def merge_asp_group(chat_id: str, language: str, title: str = "",
@@ -612,6 +676,52 @@ async def _send_asp_intro(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await update.message.reply_text(
             f"❌ ASP {language} introduction failed. This group was NOT added to the ASP list."
         )
+
+
+def load_broadcast_exclusions() -> Set[str]:
+    """Load permanent /broadcastexcept exclusions. Supports a JSON list of IDs or objects with chat_id."""
+    path = Path(BROADCAST_EXCLUSIONS_FILE)
+    if not path.exists():
+        logger.warning(f"{BROADCAST_EXCLUSIONS_FILE} is missing; /broadcastexcept will exclude 0 groups.")
+        return set()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8") or "[]")
+        result: Set[str] = set()
+        if isinstance(raw, list):
+            for item in raw:
+                cid = item.get("chat_id") if isinstance(item, dict) else item
+                if cid is not None and str(cid).strip():
+                    result.add(str(cid).strip())
+        elif isinstance(raw, dict):
+            for cid in raw.keys():
+                if str(cid).strip():
+                    result.add(str(cid).strip())
+        return result
+    except Exception as e:
+        logger.exception(f"Failed to load {BROADCAST_EXCLUSIONS_FILE}: {e}")
+        return set()
+
+
+async def _send_oa_intro(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         image_path: Path, caption: str) -> None:
+    chat = update.effective_chat
+    if not chat or chat.type not in (Chat.GROUP, Chat.SUPERGROUP):
+        await update.message.reply_text("Please use this command inside the insured group chat.")
+        return
+    if not image_path.exists():
+        await update.message.reply_text(f"❌ Occupational Accident image is missing: {image_path.name}")
+        logger.error(f"Missing Occupational Accident image: {image_path}")
+        return
+    try:
+        with image_path.open("rb") as photo:
+            await context.bot.send_photo(chat_id=chat.id, photo=photo, caption=caption)
+        try:
+            await update.message.delete()
+        except Exception as delete_error:
+            logger.warning(f"OAE sent, but command could not be deleted in {chat.id}: {delete_error}")
+    except Exception as e:
+        logger.exception(f"Failed to send OAE introduction to {chat.id}: {e}")
+        await update.message.reply_text("❌ Occupational Accident introduction failed.")
 
 
 # Authorized users (seen in AIS team chats) + preloaded env IDs
@@ -926,6 +1036,9 @@ def require_and_record(func):
     @require_authorized
     async def inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
         record_message_for_transcript(update)
+        chat = update.effective_chat
+        if chat and chat.type in (Chat.GROUP, Chat.SUPERGROUP):
+            await mark_daily_activity(str(chat.id))
         return await func(update, context)
     return inner
 
@@ -937,6 +1050,11 @@ async def aspe_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @require_and_record
 async def aspr_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_asp_intro(update, context, "RU", ASP_RUSSIAN_IMAGE, ASP_RUSSIAN_TEXT)
+
+
+@require_and_record
+async def oae_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _send_oa_intro(update, context, OA_ENGLISH_IMAGE, OA_ENGLISH_TEXT)
 
 
 @require_and_record
@@ -1043,10 +1161,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ssc – Email transcript to coi@\n"
         "/who – List known groups (title + ID)\n"
         "/broadcast – Send one-time announcement to all groups\n"
+        "/broadcastexcept – Send to all groups except the permanent exclusion list\n"
         "/broadcastpin – Broadcast and try to pin in all groups\n"
         "/broadcastto – Targeted broadcast to specific group(s) by ID or name\n"
         "/ASPE – Send English ASP introduction + save group to ASP EN list\n"
         "/ASPR – Send Russian ASP introduction + save group to ASP RU list\n"
+        "/OAE – Send the English Occupational Accident image and text\n"
         "/aspcount – Show ASP English/Russian/unique group counts\n"
         "/aspwho – List saved ASP groups in safe chunks\n"
         "/aspbroadcaste – Broadcast text to ASP English groups only\n"
@@ -1174,6 +1294,33 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"/broadcast failed for chat {cid}: {e}")
         total += 1
     await update.message.reply_text(f"📣 Broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
+
+@require_and_record
+async def broadcastexcept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (update.message.text or "").split(" ", 1)
+    if len(msg) < 2 or not msg[1].strip():
+        await update.message.reply_text("Usage:\n/broadcastexcept Your announcement text")
+        return
+    text = msg[1].strip()
+    exclusions = load_broadcast_exclusions()
+    all_ids = list(known_group_chats.keys())
+    targets = [cid for cid in all_ids if cid not in exclusions]
+    excluded_saved = sum(1 for cid in all_ids if cid in exclusions)
+    ok = fail = 0
+    for cid in targets:
+        try:
+            await context.bot.send_message(chat_id=int(cid), text=text)
+            ok += 1
+        except Exception as e:
+            fail += 1
+            logger.error(f"/broadcastexcept failed for chat {cid}: {e}")
+    await update.message.reply_text(
+        "📣 Broadcast-except complete.\n"
+        f"✅ {ok} succeeded • ❌ {fail} failed\n"
+        f"🚫 {excluded_saved} saved groups excluded • 📦 {len(targets)} groups targeted\n"
+        f"📋 {len(exclusions)} unique IDs are in the permanent exclusion file."
+    )
+
 
 @require_and_record
 async def broadcastpin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1510,8 +1657,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     maybe_record_team_member(update)
     record_message_for_transcript(update)
 
-    # Mark this chat as active today (any chat)
-    LAST_CHAT_ACTIVITY[chat_id] = now.strftime("%Y-%m-%d")
+    # Mark this group as active today. PostgreSQL preserves the full-day list through Railway restarts.
+    if chat.type in (Chat.GROUP, Chat.SUPERGROUP):
+        await mark_daily_activity(chat_id)
 
     is_auth = bool(user and is_authorized_user(user.id))
     is_silent_chat = chat_id in SILENT_GROUP_IDS
@@ -1573,16 +1721,22 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_buffered(chat_id, "AM", context)
     return
 
-# ---------------- Scheduler: 4:00 PM CT last call (weekdays, only chats active today) ----------------
+# ---------------- Scheduler: 3:00 PM CT last call (weekdays, all chats active that day) ----------------
 async def last_call_scheduler(app):
+    last_run_date: Optional[str] = None
     while True:
         now_local = now_in_timezone()
         try:
-            # Weekdays only, at 16:00 local time
-            if now_local.weekday() < 5 and now_local.time().hour == LAST_CALL_TIME.hour and now_local.time().minute == LAST_CALL_TIME.minute:
-                today_str = now_local.strftime("%Y-%m-%d")
-                targets = [cid for cid, d in LAST_CHAT_ACTIVITY.items()
-                           if d == today_str and cid not in SILENT_GROUP_IDS]
+            # Weekdays only, once at 3:00 PM CT. Includes every group active since midnight CT.
+            today_str = now_local.strftime("%Y-%m-%d")
+            if (now_local.weekday() < 5
+                    and now_local.time().hour == LAST_CALL_TIME.hour
+                    and now_local.time().minute == LAST_CALL_TIME.minute
+                    and last_run_date != today_str):
+                active_ids = await get_active_group_ids(today_str)
+                targets = sorted(cid for cid in active_ids if cid not in SILENT_GROUP_IDS)
+                last_run_date = today_str
+                logger.info(f"Last Call targeting {len(targets)} groups active on {today_str}.")
                 for chat_id in targets:
                     try:
                         await app.bot.send_message(chat_id=int(chat_id), text=LAST_CALL_MESSAGE, parse_mode="Markdown")
@@ -1655,10 +1809,12 @@ async def main():
     app.add_handler(CommandHandler("ssc", ssc_command))
     app.add_handler(CommandHandler("who", who_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
+    app.add_handler(CommandHandler("broadcastexcept", broadcastexcept_command))
     app.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
     app.add_handler(CommandHandler("broadcastto", broadcastto_command))
     app.add_handler(CommandHandler("aspe", aspe_command))
     app.add_handler(CommandHandler("aspr", aspr_command))
+    app.add_handler(CommandHandler("oae", oae_command))
     app.add_handler(CommandHandler("aspcount", aspcount_command))
     app.add_handler(CommandHandler("aspwho", aspwho_command))
     app.add_handler(CommandHandler("aspbroadcaste", aspbroadcaste_command))
@@ -1670,7 +1826,7 @@ async def main():
     app.add_handler(CommandHandler("matchinsured", matchinsured_command))
 
     # Messages
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    app.add_handler(MessageHandler(~filters.COMMAND, message_handler))
 
     app.add_error_handler(on_error)
 
@@ -1680,12 +1836,12 @@ async def main():
     logger.info(
         "✅ Bot running: command-only authorized groups; 2h cooldown per group; "
         "no auto-ack; /time(/hours) and /coi commands; "
-        "Last Call 4:00 PM CT (active chats only); cutoff at 4:30 PM; "
+        "Last Call 3:00 PM CT (all groups active that day, persisted in PostgreSQL); cutoff at 4:30 PM; "
         "ALL auto prompts use 5-min flood buffer (cancelled if an authorized user speaks; AM cancels at opening); "
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
         "AM/PM spiels once per day per *group chat* with strong debouncing; "
         "SendGrid email (plain-text transcripts, subject=group title); "
-        "/who, /broadcast, /broadcastpin, /broadcastto, /ASPE, /ASPR, and ASP registry commands."
+        "/who, /broadcast, /broadcastexcept, /broadcastpin, /broadcastto, /ASPE, /ASPR, /OAE, and ASP registry commands."
     )
     await app.run_polling()
 
