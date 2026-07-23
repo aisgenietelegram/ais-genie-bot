@@ -369,19 +369,6 @@ async def init_db():
                     PRIMARY KEY (chat_id, activity_date)
                 )
             """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS scheduled_campaign_runs (
-                    campaign_key TEXT NOT NULL,
-                    run_date TEXT NOT NULL,
-                    started_at TEXT NOT NULL,
-                    completed_at TEXT,
-                    target_count INTEGER DEFAULT 0,
-                    success_count INTEGER DEFAULT 0,
-                    failure_count INTEGER DEFAULT 0,
-                    status TEXT NOT NULL DEFAULT 'STARTED',
-                    PRIMARY KEY (campaign_key, run_date)
-                )
-            """)
         logger.info("PostgreSQL persistence initialized.")
     except Exception as e:
         db_pool = None
@@ -1174,7 +1161,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/ssc – Email transcript to coi@\n"
         "/who – List known groups (title + ID)\n"
         "/broadcast – Send one-time announcement to all groups\n"
-        "/broadcastexcept – Send to all groups except the permanent exclusion list\n"
+        "/broadcastexcept – Send a photo + caption to all groups except the permanent exclusion list\n"
         "/broadcastpin – Broadcast and try to pin in all groups\n"
         "/broadcastto – Targeted broadcast to specific group(s) by ID or name\n"
         "/ASPE – Send English ASP introduction + save group to ASP EN list\n"
@@ -1308,30 +1295,83 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total += 1
     await update.message.reply_text(f"📣 Broadcast sent.\n✅ {ok} succeeded • ❌ {fail} failed • 📦 {total} groups total.")
 
+def _broadcast_command_text(update: Update) -> str:
+    """Return command text from a normal message or a photo caption."""
+    message = update.effective_message
+    if not message:
+        return ""
+    return (message.text or message.caption or "").strip()
+
+
+def _broadcast_photo_file_id(update: Update) -> Optional[str]:
+    """Return the largest attached/replied Telegram photo file ID, if present."""
+    message = update.effective_message
+    if not message:
+        return None
+    if message.photo:
+        return message.photo[-1].file_id
+    replied = message.reply_to_message
+    if replied and replied.photo:
+        return replied.photo[-1].file_id
+    return None
+
+
+def _suppress_auto_spiels_after_staff_broadcast(chat_id: str) -> None:
+    """Treat a successful staff broadcast as authorized activity in the recipient group."""
+    cid = str(chat_id)
+    set_last_auth_msg(cid)
+    cancel_all_pending_for_chat(cid)
+
+
 @require_and_record
 async def broadcastexcept_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (update.message.text or "").split(" ", 1)
+    raw = _broadcast_command_text(update)
+    msg = raw.split(" ", 1)
     if len(msg) < 2 or not msg[1].strip():
-        await update.message.reply_text("Usage:\n/broadcastexcept Your announcement text")
+        await update.effective_message.reply_text(
+            "Usage:\n"
+            "1. Attach a photo and use this caption:\n"
+            "/broadcastexcept Your announcement text\n\n"
+            "2. Or reply to a photo with:\n"
+            "/broadcastexcept Your announcement text"
+        )
         return
+
     text = msg[1].strip()
+    photo_file_id = _broadcast_photo_file_id(update)
+    if not photo_file_id:
+        await update.effective_message.reply_text(
+            "❌ Please attach a photo, or reply to a photo, when using /broadcastexcept."
+        )
+        return
+
     exclusions = load_broadcast_exclusions()
     all_ids = list(known_group_chats.keys())
     targets = [cid for cid in all_ids if cid not in exclusions]
     excluded_saved = sum(1 for cid in all_ids if cid in exclusions)
     ok = fail = 0
+
     for cid in targets:
         try:
-            await context.bot.send_message(chat_id=int(cid), text=text)
+            await context.bot.send_photo(
+                chat_id=int(cid),
+                photo=photo_file_id,
+                caption=text,
+            )
+            _suppress_auto_spiels_after_staff_broadcast(cid)
             ok += 1
+            await asyncio.sleep(0.12)
         except Exception as e:
             fail += 1
             logger.error(f"/broadcastexcept failed for chat {cid}: {e}")
-    await update.message.reply_text(
+
+    await update.effective_message.reply_text(
         "📣 Broadcast-except complete.\n"
+        "🖼️ Photo: included\n"
         f"✅ {ok} succeeded • ❌ {fail} failed\n"
         f"🚫 {excluded_saved} saved groups excluded • 📦 {len(targets)} groups targeted\n"
-        f"📋 {len(exclusions)} unique IDs are in the permanent exclusion file."
+        f"📋 {len(exclusions)} unique IDs are in the permanent exclusion file.\n"
+        "🌙 Pending after-hours/lunch/weekend/cutoff auto-replies were cancelled for successful recipients."
     )
 
 
@@ -1734,246 +1774,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_buffered(chat_id, "AM", context)
     return
 
-
-# ---------------- Automatic campaign scheduler (Central Time) ----------------
-# Monday=0 ... Sunday=6
-AUTO_CAMPAIGN_SCHEDULES = (
-    {
-        "key": "ASPE_0830",
-        "name": "ASPE",
-        "weekdays": {0, 1, 4},  # Mon, Tue, Fri
-        "send_time": time(8, 30),
-        "image": ASP_ENGLISH_IMAGE,
-        "caption": ASP_ENGLISH_TEXT,
-        "exclude_protected": True,
-    },
-    {
-        "key": "OAE_0900",
-        "name": "OAE",
-        "weekdays": {0, 1, 2, 3, 4},  # Mon-Fri
-        "send_time": time(9, 0),
-        "image": OA_ENGLISH_IMAGE,
-        "caption": OA_ENGLISH_TEXT,
-        "exclude_protected": False,
-    },
-    {
-        "key": "OAE_1530",
-        "name": "OAE",
-        "weekdays": {0, 1, 2, 3, 4},  # Mon-Fri
-        "send_time": time(15, 30),
-        "image": OA_ENGLISH_IMAGE,
-        "caption": OA_ENGLISH_TEXT,
-        "exclude_protected": False,
-    },
-    {
-        "key": "ASPR_1825",
-        "name": "ASPR",
-        "weekdays": {2, 3, 4},  # Wed, Thu, Fri
-        "send_time": time(18, 25),
-        "image": ASP_RUSSIAN_IMAGE,
-        "caption": ASP_RUSSIAN_TEXT,
-        "exclude_protected": True,
-    },
-)
-
-CAMPAIGN_CATCHUP_MINUTES = 20
-MIN_PROTECTED_EXCLUSIONS = 100
-
-
-async def _claim_campaign_run(campaign_key: str, run_date: str) -> bool:
-    """Atomically claim a scheduled run. Fail closed when PostgreSQL is unavailable."""
-    if not db_pool:
-        logger.error(
-            f"[AUTO CAMPAIGN BLOCKED] {campaign_key}: PostgreSQL unavailable; "
-            "automatic sending is disabled to prevent duplicates or unsafe delivery."
-        )
-        return False
-    try:
-        async with db_pool.acquire() as conn:
-            result = await conn.execute(
-                """
-                INSERT INTO scheduled_campaign_runs
-                    (campaign_key, run_date, started_at, status)
-                VALUES ($1, $2, $3, 'STARTED')
-                ON CONFLICT (campaign_key, run_date) DO NOTHING
-                """,
-                campaign_key,
-                run_date,
-                now_in_timezone().isoformat(),
-            )
-        return result.endswith("1")
-    except Exception as e:
-        logger.exception(f"[AUTO CAMPAIGN BLOCKED] Could not claim {campaign_key}/{run_date}: {e}")
-        return False
-
-
-async def _finish_campaign_run(
-    campaign_key: str,
-    run_date: str,
-    status: str,
-    target_count: int,
-    success_count: int,
-    failure_count: int,
-) -> None:
-    if not db_pool:
-        return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE scheduled_campaign_runs
-                SET completed_at = $3,
-                    target_count = $4,
-                    success_count = $5,
-                    failure_count = $6,
-                    status = $7
-                WHERE campaign_key = $1 AND run_date = $2
-                """,
-                campaign_key,
-                run_date,
-                now_in_timezone().isoformat(),
-                target_count,
-                success_count,
-                failure_count,
-                status,
-            )
-    except Exception as e:
-        logger.exception(f"Failed to finalize campaign run {campaign_key}/{run_date}: {e}")
-
-
-def _build_automatic_campaign_targets(exclude_protected: bool) -> Tuple[Optional[List[str]], str]:
-    """Return safe targets or None with a reason. Protected campaigns fail closed."""
-    all_ids = set(str(cid).strip() for cid in known_group_chats.keys() if str(cid).strip())
-    if not all_ids:
-        return None, "No saved Telegram groups are loaded."
-
-    if not exclude_protected:
-        return sorted(all_ids), f"all={len(all_ids)}"
-
-    exclusion_path = Path(BROADCAST_EXCLUSIONS_FILE)
-    if not exclusion_path.exists():
-        return None, f"{BROADCAST_EXCLUSIONS_FILE} is missing."
-
-    exclusions = load_broadcast_exclusions()
-    matched_exclusions = all_ids.intersection(exclusions)
-    targets = all_ids.difference(exclusions)
-
-    if len(exclusions) < MIN_PROTECTED_EXCLUSIONS:
-        return None, (
-            f"Only {len(exclusions)} exclusion IDs loaded; minimum safety threshold is "
-            f"{MIN_PROTECTED_EXCLUSIONS}."
-        )
-    if len(matched_exclusions) < MIN_PROTECTED_EXCLUSIONS:
-        return None, (
-            f"Only {len(matched_exclusions)} protected IDs match the saved registry; "
-            f"minimum safety threshold is {MIN_PROTECTED_EXCLUSIONS}."
-        )
-    if targets.intersection(exclusions):
-        return None, "A protected chat ID was found in the target set."
-    if len(targets) != len(all_ids) - len(matched_exclusions):
-        return None, "Target-count validation failed."
-    if len(targets) >= len(all_ids):
-        return None, "Protected campaign target count is not smaller than the full registry."
-
-    detail = (
-        f"all={len(all_ids)}, exclusions_file={len(exclusions)}, "
-        f"protected_in_registry={len(matched_exclusions)}, targets={len(targets)}"
-    )
-    return sorted(targets), detail
-
-
-async def _send_campaign_photo_to_chat(app, chat_id: str, image_path: Path, caption: str) -> bool:
-    """Send one campaign photo with conservative pacing and RetryAfter support."""
-    if not image_path.exists():
-        logger.error(f"Campaign image is missing: {image_path}")
-        return False
-
-    for attempt in range(2):
-        try:
-            with image_path.open("rb") as photo:
-                await app.bot.send_photo(chat_id=int(chat_id), photo=photo, caption=caption)
-            await asyncio.sleep(0.12)
-            return True
-        except Exception as e:
-            retry_after = getattr(e, "retry_after", None)
-            if retry_after is not None and attempt == 0:
-                wait_seconds = float(retry_after) + 1.0
-                logger.warning(f"Telegram rate limit for {chat_id}; waiting {wait_seconds:.1f}s.")
-                await asyncio.sleep(wait_seconds)
-                continue
-            logger.error(f"Automatic campaign failed for chat {chat_id}: {e}")
-            return False
-    return False
-
-
-async def _run_automatic_campaign(app, campaign: Dict[str, Any], run_date: str) -> None:
-    key = str(campaign["key"])
-    name = str(campaign["name"])
-    image_path = Path(campaign["image"])
-    caption = str(campaign["caption"])
-    exclude_protected = bool(campaign["exclude_protected"])
-
-    targets, detail = _build_automatic_campaign_targets(exclude_protected)
-    if targets is None:
-        logger.critical(f"[AUTO CAMPAIGN BLOCKED] {key}: {detail}")
-        return
-    if not image_path.exists():
-        logger.critical(f"[AUTO CAMPAIGN BLOCKED] {key}: missing image {image_path.name}")
-        return
-
-    # Claim only after all safety checks pass. PostgreSQL prevents duplicate sends after Railway restarts.
-    if not await _claim_campaign_run(key, run_date):
-        logger.info(f"[AUTO CAMPAIGN SKIPPED] {key}/{run_date}: already claimed or database unavailable.")
-        return
-
-    logger.warning(
-        f"[AUTO CAMPAIGN START] {key} ({name}) on {run_date}: {detail}; "
-        f"protected_exclusions={'ON' if exclude_protected else 'OFF'}"
-    )
-
-    ok = 0
-    fail = 0
-    exclusions_snapshot = load_broadcast_exclusions() if exclude_protected else set()
-    for cid in targets:
-        if exclude_protected and cid in exclusions_snapshot:
-            # Final per-recipient guard immediately before sending.
-            logger.critical(f"[AUTO CAMPAIGN SAFETY STOP] Protected ID entered target loop: {cid}")
-            fail += 1
-            continue
-        if await _send_campaign_photo_to_chat(app, cid, image_path, caption):
-            ok += 1
-        else:
-            fail += 1
-
-    status = "COMPLETED" if fail == 0 else "COMPLETED_WITH_FAILURES"
-    await _finish_campaign_run(key, run_date, status, len(targets), ok, fail)
-    logger.warning(
-        f"[AUTO CAMPAIGN COMPLETE] {key}: targets={len(targets)}, success={ok}, failed={fail}"
-    )
-
-
-async def automatic_campaign_scheduler(app):
-    """Run each campaign once in a 20-minute catch-up window, using America/Chicago."""
-    while True:
-        try:
-            now_local = now_in_timezone()
-            run_date = now_local.strftime("%Y-%m-%d")
-            current_minutes = now_local.hour * 60 + now_local.minute
-
-            for campaign in AUTO_CAMPAIGN_SCHEDULES:
-                if now_local.weekday() not in campaign["weekdays"]:
-                    continue
-                scheduled = campaign["send_time"]
-                scheduled_minutes = scheduled.hour * 60 + scheduled.minute
-                if scheduled_minutes <= current_minutes < scheduled_minutes + CAMPAIGN_CATCHUP_MINUTES:
-                    await _run_automatic_campaign(app, campaign, run_date)
-
-            await asyncio.sleep(30)
-        except Exception:
-            logger.exception("automatic_campaign_scheduler loop error")
-            await asyncio.sleep(30)
-
-
 # ---------------- Scheduler: 3:00 PM CT last call (weekdays, all chats active that day) ----------------
 async def last_call_scheduler(app):
     last_run_date: Optional[str] = None
@@ -2063,6 +1863,11 @@ async def main():
     app.add_handler(CommandHandler("who", who_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     app.add_handler(CommandHandler("broadcastexcept", broadcastexcept_command))
+    # Photo captions are not handled consistently by CommandHandler across PTB versions.
+    app.add_handler(MessageHandler(
+        filters.PHOTO & filters.CaptionRegex(r"(?i)^/broadcastexcept(?:@\w+)?(?:\s|$)"),
+        broadcastexcept_command,
+    ))
     app.add_handler(CommandHandler("broadcastpin", broadcastpin_command))
     app.add_handler(CommandHandler("broadcastto", broadcastto_command))
     app.add_handler(CommandHandler("aspe", aspe_command))
@@ -2083,16 +1888,12 @@ async def main():
 
     app.add_error_handler(on_error)
 
-    # Kick off automatic campaign and last-call schedulers
-    asyncio.create_task(automatic_campaign_scheduler(app))
+    # Kick off last-call scheduler
     asyncio.create_task(last_call_scheduler(app))
 
     logger.info(
         "✅ Bot running: command-only authorized groups; 2h cooldown per group; "
-        "no auto-ack; /time(/hours) and /coi commands; "
-        "Automatic campaigns: ASPE 8:30 AM Mon/Tue/Fri (protected exclusions ON); "
-        "OAE 9:00 AM and 3:30 PM Mon-Fri (all saved groups); "
-        "ASPR 6:25 PM Wed/Thu/Fri (protected exclusions ON); "
+        "no auto-ack; automatic ASPE/OAE/ASPR campaigns disabled; /time(/hours) and /coi commands; "
         "Last Call 3:00 PM CT (all groups active that day, persisted in PostgreSQL); cutoff at 4:30 PM; "
         "ALL auto prompts use 5-min flood buffer (cancelled if an authorized user speaks; AM cancels at opening); "
         "after-hours: 2h suppression after authorized posts with 1h silence threshold; "
